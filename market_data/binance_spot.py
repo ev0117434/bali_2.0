@@ -91,7 +91,7 @@ async def _ws_worker(
 
                         # Binance bookTicker не содержит exchange-timestamp
                         # => latency не вычислить; ставим 0
-                        stats.record_message(symbol=sym)
+                        stats.record_message(rtt_ms=None, symbol=sym)
                         conn_stats.msgs_total  += 1
                         conn_stats.msgs_window += 1
                         conn_stats.last_msg_ts  = recv_ts
@@ -139,6 +139,9 @@ async def _ticker_flusher(redis_client, stats: Stats, chunk_manager: ChunkManage
                     "ts":  f"{ts:.3f}",
                 })
             await pipe.execute()
+            write_ts = __import__("time").time()
+            for _, (_, _, recv_ts) in batch.items():
+                stats.record_proc_latency((write_ts - recv_ts) * 1000)
             stats.record_ticker_write(len(batch))
         except Exception:
             pass

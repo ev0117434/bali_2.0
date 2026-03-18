@@ -79,7 +79,12 @@ class Stats:
     history_entries_total:  int = 0
     history_entries_window: int = 0
 
-    latencies_window: List[float] = field(default_factory=list)
+    # RTT: exchange_timestamp → recv_ts  (сетевая задержка биржа→скрипт)
+    # Недоступна для Binance bookTicker (нет exchange timestamp в потоке)
+    rtt_latencies_window:  List[float] = field(default_factory=list)
+
+    # Internal: recv_ts → redis write complete  (время в буфере + pipeline)
+    proc_latencies_window: List[float] = field(default_factory=list)
 
     symbols_active_window: Set[str] = field(default_factory=set)
     symbols_tracked: int = 0
@@ -92,18 +97,24 @@ class Stats:
         self.msgs_window              = 0
         self.ticker_writes_window     = 0
         self.history_entries_window   = 0
-        self.latencies_window.clear()
+        self.rtt_latencies_window.clear()
+        self.proc_latencies_window.clear()
         self.symbols_active_window.clear()
         for c in self.connections:
             c.msgs_window = 0
 
-    def record_message(self, latency_ms: Optional[float] = None, symbol: str = ""):
+    def record_message(self, rtt_ms: Optional[float] = None, symbol: str = ""):
         self.msgs_total  += 1
         self.msgs_window += 1
-        if latency_ms is not None and latency_ms > 0:
-            self.latencies_window.append(latency_ms)
+        if rtt_ms is not None and rtt_ms > 0:
+            self.rtt_latencies_window.append(rtt_ms)
         if symbol:
             self.symbols_active_window.add(symbol)
+
+    def record_proc_latency(self, ms: float):
+        """Вызывается из ticker_flusher после записи pipeline в Redis."""
+        if ms > 0:
+            self.proc_latencies_window.append(ms)
 
     def record_ticker_write(self, n: int = 1):
         self.ticker_writes_total  += n
@@ -436,11 +447,8 @@ class SnapshotLogger:
         rate_tick = s.ticker_writes_window / elapsed if elapsed > 0 else 0.0
         rate_hist = s.history_entries_window / elapsed if elapsed > 0 else 0.0
 
-        lat = s.latencies_window
-        lat_min = min(lat) if lat else 0.0
-        lat_avg = sum(lat) / len(lat) if lat else 0.0
-        lat_p95 = self._percentile(lat, 95)
-        lat_max = max(lat) if lat else 0.0
+        rtt  = s.rtt_latencies_window
+        proc = s.proc_latencies_window
 
         lines = [
             "=" * 66,
@@ -472,10 +480,26 @@ class SnapshotLogger:
             f"  Отслеживается:  {s.symbols_tracked}",
             f"  Активных за {SNAPSHOT_INTERVAL}s: {len(s.symbols_active_window)}",
             "",
-            f"ЗАДЕРЖКИ ({len(lat)} сэмплов за {SNAPSHOT_INTERVAL}s)",
-            f"  Min: {lat_min:.2f}ms  |  Avg: {lat_avg:.2f}ms  "
-            f"|  P95: {lat_p95:.2f}ms  |  Max: {lat_max:.2f}ms",
+            "ЗАДЕРЖКИ",
         ]
+        # RTT (биржа → скрипт)
+        if rtt:
+            lines.append(
+                f"  RTT (exchange→recv)  [{len(rtt):>5} сэмплов]:  "
+                f"min={min(rtt):.2f}  avg={sum(rtt)/len(rtt):.2f}  "
+                f"p95={self._percentile(rtt,95):.2f}  max={max(rtt):.2f} ms"
+            )
+        else:
+            lines.append("  RTT (exchange→recv)  — нет данных (биржа не даёт timestamp)")
+        # Internal (recv → redis write)
+        if proc:
+            lines.append(
+                f"  Internal (recv→Redis)[{len(proc):>5} сэмплов]:  "
+                f"min={min(proc):.2f}  avg={sum(proc)/len(proc):.2f}  "
+                f"p95={self._percentile(proc,95):.2f}  max={max(proc):.2f} ms"
+            )
+        else:
+            lines.append("  Internal (recv→Redis) — нет данных")
 
         if self.chunk_manager:
             lines += ["", "REDIS HISTORY ЧАНКИ"]
