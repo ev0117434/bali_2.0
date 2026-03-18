@@ -108,7 +108,7 @@ async def launch(info: ProcInfo) -> None:
     info.proc = await asyncio.create_subprocess_exec(
         sys.executable,
         str(SCRIPTS_DIR / info.script),
-        env={**os.environ},          # передать все переменные окружения
+        env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
         cwd=str(SCRIPTS_DIR),
     )
     info.pid      = info.proc.pid

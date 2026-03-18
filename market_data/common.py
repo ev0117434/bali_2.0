@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -25,6 +26,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import redis.asyncio as aioredis
+
+# Принудительно выставляем UTF-8 для stdout/stderr (актуально при запуске
+# через run_all.py или в окружениях без локали UTF-8)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -213,7 +221,7 @@ class LogManager:
         fh.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(fh)
 
-        ch = logging.StreamHandler()
+        ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.INFO)
         ch.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(ch)
