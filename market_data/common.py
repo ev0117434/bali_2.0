@@ -270,7 +270,7 @@ class ChunkManager:
         self.market   = market
         self.redis    = redis_client
         self.prefix   = f"{exchange}:{market}"
-        self.config_key = f"{self.prefix}:chunks:config"
+        self.config_key = f"md:{exchange}:{market}:chunks:config"
 
         self.current_chunk_id: int          = 0
         self.chunk_start_ts:   float        = 0.0
@@ -292,7 +292,7 @@ class ChunkManager:
         await self.redis.set(self.config_key, json.dumps(config, ensure_ascii=False))
 
     async def _delete_chunk_keys(self, chunk_id: int) -> int:
-        pattern = f"{self.prefix}:history:*:{chunk_id}"
+        pattern = f"md:hist:{self.exchange}:{self.market}:*:{chunk_id}"
         cursor, deleted = b"0", 0
         while True:
             cursor, keys = await self.redis.scan(cursor, match=pattern, count=500)
@@ -360,10 +360,10 @@ class ChunkManager:
         return time.time() - self.chunk_start_ts >= HISTORY_CHUNK_SECONDS
 
     def get_history_key(self, symbol: str) -> str:
-        return f"{self.prefix}:history:{symbol}:{self.current_chunk_id}"
+        return f"md:hist:{self.exchange}:{self.market}:{symbol}:{self.current_chunk_id}"
 
     def get_ticker_key(self, symbol: str) -> str:
-        return f"{self.prefix}:ticker:{symbol}"
+        return f"md:{self.exchange}:{self.market}:{symbol}"
 
     def elapsed(self) -> float:
         return time.time() - self.chunk_start_ts
