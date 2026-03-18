@@ -17,13 +17,57 @@ market_data/run_all.py — Запуск всех 8 сборщиков рыноч
 
 import asyncio
 import os
+import shutil
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
+
+sys.path.insert(0, str(Path(__file__).parent))
+from common import create_redis, LOGS_DIR
+
+# ─── Предстартовая очистка ────────────────────────────────────────────────────
+
+async def flush_redis() -> int:
+    """Удаляет все ключи md:* из Redis. Возвращает количество удалённых ключей."""
+    client = await create_redis()
+    cursor, deleted = b"0", 0
+    while True:
+        cursor, keys = await client.scan(cursor, match="md:*", count=500)
+        if keys:
+            await client.delete(*keys)
+            deleted += len(keys)
+        if cursor in (b"0", 0):
+            break
+    await client.aclose()
+    return deleted
+
+
+def ask_clear_logs() -> bool:
+    """Спрашивает пользователя об очистке папки logs/. Возвращает True если да."""
+    try:
+        ans = input("Очистить папку logs/? [y/N]: ").strip().lower()
+        return ans in ("y", "yes", "д", "да")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def clear_logs() -> int:
+    """Удаляет содержимое папки logs/. Возвращает количество удалённых поддиректорий."""
+    if not LOGS_DIR.exists():
+        return 0
+    count = 0
+    for item in LOGS_DIR.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+            count += 1
+        else:
+            item.unlink()
+    return count
+
 
 # ─── Список скриптов ──────────────────────────────────────────────────────────
 SCRIPTS_DIR = Path(__file__).parent
@@ -192,6 +236,26 @@ async def _terminate_all(procs: List[ProcInfo]) -> None:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main() -> None:
+
+    # ── 1. Очистка Redis (всегда) ────────────────────────────────────────────
+    print("[run_all] Очищаю Redis (md:*)...", end=" ", flush=True)
+    try:
+        n = await flush_redis()
+        print(f"удалено {n} ключей.")
+    except Exception as exc:
+        print(f"\n[run_all] ОШИБКА подключения к Redis: {exc}")
+        sys.exit(1)
+
+    # ── 2. Очистка логов (по запросу) ────────────────────────────────────────
+    if ask_clear_logs():
+        n = clear_logs()
+        print(f"[run_all] Логи очищены ({n} папок удалено).")
+    else:
+        print("[run_all] Логи оставлены без изменений.")
+
+    print()
+
+    # ── 3. Старт ─────────────────────────────────────────────────────────────
     manager_start = time.time()
     stop_event    = asyncio.Event()
 
