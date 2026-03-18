@@ -269,8 +269,8 @@ class ChunkManager:
         self.exchange = exchange
         self.market   = market
         self.redis    = redis_client
-        self.prefix   = f"{exchange}:{market}"
-        self.config_key = f"md:{exchange}:{market}:chunks:config"
+        self.field_key  = f"{exchange}:{market}"    # поле в глобальном Hash
+        self.config_key = "md:chunks:config"          # один ключ на всю систему
 
         self.current_chunk_id: int          = 0
         self.chunk_start_ts:   float        = 0.0
@@ -284,12 +284,17 @@ class ChunkManager:
     # ── internal ─────────────────────────────────────────────────────────────
 
     async def _save(self):
+        """Сохраняет конфиг своего exchange:market в глобальный Hash md:chunks:config."""
         config = {
             "current_chunk_id": self.current_chunk_id,
             "active_chunks":    self.active_chunks,
             "chunks":           self.chunk_meta,
         }
-        await self.redis.set(self.config_key, json.dumps(config, ensure_ascii=False))
+        await self.redis.hset(
+            self.config_key,
+            self.field_key,
+            json.dumps(config, ensure_ascii=False),
+        )
 
     async def _delete_chunk_keys(self, chunk_id: int) -> int:
         pattern = f"md:hist:{self.exchange}:{self.market}:*:{chunk_id}"
@@ -314,7 +319,7 @@ class ChunkManager:
     # ── public ───────────────────────────────────────────────────────────────
 
     async def initialize(self):
-        raw = await self.redis.get(self.config_key)
+        raw = await self.redis.hget(self.config_key, self.field_key)
         if raw:
             try:
                 cfg = json.loads(raw)

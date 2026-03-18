@@ -37,7 +37,7 @@ CHUNK_SIZE = 300
 PING_INTERVAL = 25
 MAX_RECONNECT_DELAY = 60
 
-_ticker_buf:  Dict[str, Tuple[str, str, str, str, float, float]] = {}
+_ticker_buf:  Dict[str, Tuple[str, str, float]] = {}
 _history_buf: Dict[str, List[Tuple[float, str, str]]] = {}
 
 
@@ -127,7 +127,7 @@ async def _ws_worker(
                                 conn_stats.msgs_window += 1
                                 conn_stats.last_msg_ts  = recv_ts
 
-                                _ticker_buf[sym] = (bid, ask, bq, aq, recv_ts, latency_ms)
+                                _ticker_buf[sym] = (bid, ask, recv_ts)
                                 if sym not in _history_buf:
                                     _history_buf[sym] = []
                                 _history_buf[sym].append((recv_ts, bid, ask))
@@ -162,13 +162,12 @@ async def _ticker_flusher(redis_client, stats: Stats, chunk_manager: ChunkManage
         _ticker_buf.clear()
         try:
             pipe = redis_client.pipeline(transaction=False)
-            for sym, (bid, ask, bq, aq, ts, lat) in batch.items():
+            for sym, (bid, ask, ts) in batch.items():
                 key = chunk_manager.get_ticker_key(sym)
                 pipe.hset(key, mapping={
-                    "bid": bid, "ask": ask,
-                    "bid_qty": bq, "ask_qty": aq,
-                    "ts": f"{ts:.3f}", "latency_ms": f"{lat:.2f}",
-                    "exchange": EXCHANGE, "market": MARKET,
+                    "bid": bid,
+                    "ask": ask,
+                    "ts":  f"{ts:.3f}",
                 })
             await pipe.execute()
             stats.record_ticker_write(len(batch))
