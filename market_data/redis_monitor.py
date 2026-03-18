@@ -47,9 +47,11 @@ REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB       = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent   # корень проекта (bali_2.0/)
+
 INTERVAL       = float(os.getenv("MONITOR_INTERVAL", "5"))       # секунд между циклами
-LOG_DIR        = Path(os.getenv("MONITOR_LOG_DIR", "logs/redis_monitor"))
-LOG_JSON       = os.getenv("MONITOR_LOG_JSON", "0") == "1"       # 1 = JSON Lines
+LOG_DIR        = Path(os.getenv("MONITOR_LOG_DIR", str(_SCRIPT_DIR / "logs" / "redis_monitor")))
+LOG_JSON       = os.getenv("MONITOR_LOG_JSON", "1") == "1"       # 0 = читаемый текст, 1 = JSON Lines
 
 LOG_CHUNK_SECONDS = int(os.getenv("LOG_CHUNK_SECONDS", str(86400)))
 LOG_MAX_CHUNKS    = int(os.getenv("LOG_MAX_CHUNKS", "2"))
@@ -409,9 +411,22 @@ def format_json(m: dict) -> str:
     return json.dumps(m, ensure_ascii=False)
 
 
-def format_error(exc: Exception, attempt: int) -> str:
+def _service_record(event: str, **kwargs) -> str:
+    """Служебная запись в лог — JSON если LOG_JSON, иначе текст."""
     ts = datetime.now(timezone.utc).isoformat()
-    return f"[{ts}] ERROR(attempt={attempt}) {type(exc).__name__}: {exc}"
+    if LOG_JSON:
+        return json.dumps({"timestamp": ts, "event": event, **kwargs}, ensure_ascii=False)
+    parts = "  ".join(f"{k}={v}" for k, v in kwargs.items())
+    return f"[{ts}] {event}  {parts}" if parts else f"[{ts}] {event}"
+
+
+def format_error(exc: Exception, attempt: int) -> str:
+    return _service_record(
+        "error",
+        attempt=attempt,
+        error_type=type(exc).__name__,
+        message=str(exc),
+    )
 
 
 # ─── Главный цикл ─────────────────────────────────────────────────────────────
@@ -419,12 +434,18 @@ def format_error(exc: Exception, attempt: int) -> str:
 async def main() -> None:
     log = LogManager(LOG_DIR)
 
-    header = (
+    log.write(_service_record(
+        "start",
+        host=f"{REDIS_HOST}:{REDIS_PORT}",
+        db=REDIS_DB,
+        interval_s=INTERVAL,
+        json_mode=LOG_JSON,
+        log_dir=str(LOG_DIR),
+    ))
+    print(
         f"[redis_monitor] start  host={REDIS_HOST}:{REDIS_PORT}  db={REDIS_DB}"
         f"  interval={INTERVAL}s  json={LOG_JSON}  log_dir={LOG_DIR}"
     )
-    print(header)
-    log.write(header)
 
     client: Optional[aioredis.Redis] = None
     consecutive_errors = 0
@@ -437,11 +458,9 @@ async def main() -> None:
                 # ── Соединение ────────────────────────────────────────────────
                 if client is None:
                     client = await connect_redis()
-                    conn_msg = (
-                        f"[redis_monitor] connected  {REDIS_HOST}:{REDIS_PORT}"
-                    )
-                    print(conn_msg)
-                    log.write(conn_msg)
+                    msg = _service_record("connected", host=f"{REDIS_HOST}:{REDIS_PORT}")
+                    print(f"[redis_monitor] connected  {REDIS_HOST}:{REDIS_PORT}")
+                    log.write(msg)
 
                 # ── Сбор метрик ───────────────────────────────────────────────
                 metrics = await collect_metrics(client)
@@ -484,9 +503,8 @@ async def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        stop_msg = "[redis_monitor] stopped"
-        print(f"\n{stop_msg}")
-        log.write(stop_msg)
+        log.write(_service_record("stopped"))
+        print("\n[redis_monitor] stopped")
         log.close()
         if client:
             try:
