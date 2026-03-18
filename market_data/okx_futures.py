@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/okx_futures.py — Сборщик best bid/ask с OKX FUTURES (SWAP/Perp) через WebSocket.
+market_data/okx_futures.py — OKX FUTURES (SWAP/Perp) best bid/ask collector via WebSocket.
 
 WS URL  : wss://ws.okx.com:8443/ws/v5/public
-Канал   : tickers  (instId=BTC-USDT-SWAP)
-Подписка: до 300 instId на соединение
-Пинг    : строка "ping" каждые 25 сек
+Channel : tickers (instId=BTC-USDT-SWAP)
+Subscribe: up to 300 instId per connection
+Ping    : string "ping" every 25 s
 
-Конвертация символов:
-  BTCUSDT  →  BTC-USDT-SWAP   (для OKX SWAP API)
-  Ответ instId BTC-USDT-SWAP  →  BTCUSDT  (нормализация)
+Symbol conversion:
+  BTCUSDT  ->  BTC-USDT-SWAP   (for OKX SWAP API)
+  instId BTC-USDT-SWAP  ->  BTCUSDT  (normalized)
 """
 
 import asyncio
@@ -211,10 +211,10 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
     stats         = Stats()
@@ -226,7 +226,7 @@ async def main():
     for _ in sym_chunks:
         stats.connections.append(ConnectionStats())
 
-    logger.info(f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений ({WS_URL})...")
+    logger.info(f"[{script_name}] Starting {len(sym_chunks)} WS connections ({WS_URL})...")
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
     tasks = []
@@ -236,11 +236,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены.")
+    logger.info(f"[{script_name}] All tasks started.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

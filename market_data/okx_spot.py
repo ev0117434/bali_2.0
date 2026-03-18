@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/okx_spot.py — Сборщик best bid/ask с OKX SPOT через WebSocket.
+market_data/okx_spot.py — OKX SPOT best bid/ask collector via WebSocket.
 
 WS URL  : wss://ws.okx.com:8443/ws/v5/public
-Канал   : tickers  (instId=BTC-USDT)  — содержит bidPx/askPx
-Подписка: до 300 instId на соединение (рекомендация OKX)
-Пинг    : строка "ping" каждые 25 сек
+Channel : tickers (instId=BTC-USDT) — contains bidPx/askPx
+Subscribe: up to 300 instId per connection (OKX recommendation)
+Ping    : string "ping" every 25 s
 
-Конвертация символов:
-  BTCUSDT  →  BTC-USDT   (для OKX API)
-  Ответ instId BTC-USDT  →  BTCUSDT  (нормализация в Redis)
+Symbol conversion:
+  BTCUSDT  ->  BTC-USDT   (for OKX API)
+  instId BTC-USDT  ->  BTCUSDT  (normalized for Redis)
 """
 
 import asyncio
@@ -60,10 +60,10 @@ async def _ws_worker(
     conn_stats: ConnectionStats, stats: Stats,
 ) -> None:
     """
-    Одно WS-соединение для чанка symbols (нормализованный формат BTCUSDT).
-    Конвертирует в OKX-формат при подписке, обратно при получении данных.
+    One WS connection for a chunk of symbols (normalized BTCUSDT format).
+    Converts to OKX format on subscribe, back to normalized on receipt.
     """
-    # Построить маппинг: okx_inst_id → normalized_symbol
+    # Build mapping: okx_inst_id -> normalized_symbol
     inst_map: Dict[str, str] = {}
     for sym in symbols:
         okx_id = _to_okx(sym)
@@ -85,7 +85,7 @@ async def _ws_worker(
                 conn_stats.active = True
                 delay = 1
 
-                # Подписываемся на tickers для всех instId
+                # Subscribe to tickers for all instIds
                 args = [{"channel": "tickers", "instId": iid} for iid in inst_map]
                 await ws.send(json.dumps({"op": "subscribe", "args": args}))
 
@@ -107,7 +107,7 @@ async def _ws_worker(
                             continue
                         try:
                             obj = json.loads(raw)
-                            # Служебные: event=subscribe/error
+                            # Skip control messages: event=subscribe/error
                             if "event" in obj:
                                 continue
 
@@ -220,10 +220,10 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
     stats         = Stats()
@@ -235,7 +235,7 @@ async def main():
     for _ in sym_chunks:
         stats.connections.append(ConnectionStats())
 
-    logger.info(f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений ({WS_URL})...")
+    logger.info(f"[{script_name}] Starting {len(sym_chunks)} WS connections ({WS_URL})...")
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
     tasks = []
@@ -245,11 +245,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены.")
+    logger.info(f"[{script_name}] All tasks started.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

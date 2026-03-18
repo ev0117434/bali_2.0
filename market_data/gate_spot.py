@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/gate_spot.py — Сборщик best bid/ask с Gate.io SPOT через WebSocket.
+market_data/gate_spot.py — Gate.io SPOT best bid/ask collector via WebSocket.
 
 WS URL  : wss://api.gateio.ws/ws/v4/
-Канал   : spot.book_ticker
-Подписка: батчи по 100 символов в одном payload
-Пинг    : {"channel":"spot.ping","time":<ts>} каждые 25 сек
+Channel : spot.book_ticker
+Subscribe: batches of 100 symbols per payload
+Ping    : {"channel":"spot.ping","time":<ts>} every 25 s
 
-Формат символов:
-  Файл подписки: BTCUSDT
-  Gate.io WS:   BTC_USDT
-  Redis:        BTCUSDT  (нормализованный)
+Symbol format:
+  Subscribe file: BTCUSDT
+  Gate.io WS:    BTC_USDT
+  Redis:         BTCUSDT (normalized)
 
-Формат данных:
+Message fields:
   result.b  = best bid price
   result.a  = best ask price
-  result.t  = exchange timestamp (мс)
+  result.t  = exchange timestamp (ms)
   result.s  = symbol (BTC_USDT)
 """
 
@@ -40,8 +40,8 @@ from common import (
 EXCHANGE   = "gate"
 MARKET     = "spot"
 WS_URL     = "wss://api.gateio.ws/ws/v4/"
-CHUNK_SIZE = 500   # символов на одно WS-соединение
-SUB_BATCH  = 100   # символов в одном subscribe-запросе
+CHUNK_SIZE = 500   # symbols per WS connection
+SUB_BATCH  = 100   # symbols per subscribe request
 PING_INTERVAL = 25
 MAX_RECONNECT_DELAY = 60
 
@@ -68,10 +68,10 @@ async def _ws_worker(
     conn_stats: ConnectionStats, stats: Stats,
 ) -> None:
     """
-    Одно WS-соединение для чанка symbols.
-    symbols — нормализованный формат (BTCUSDT).
+    One WS connection for a symbol chunk.
+    symbols — normalized format (BTCUSDT).
     """
-    # Маппинг: gate_sym → normalized
+    # Mapping: gate_sym -> normalized
     sym_map: Dict[str, str] = {}
     gate_syms: List[str] = []
     for sym in symbols:
@@ -95,7 +95,7 @@ async def _ws_worker(
                 conn_stats.active = True
                 delay = 1
 
-                # Подписываемся батчами
+                # Subscribe in batches
                 for batch in chunk_list(gate_syms, SUB_BATCH):
                     msg = {
                         "time":    int(time.time()),
@@ -104,7 +104,7 @@ async def _ws_worker(
                         "payload": batch,
                     }
                     await ws.send(json.dumps(msg))
-                    await asyncio.sleep(0.05)  # небольшая пауза между батчами
+                    await asyncio.sleep(0.05)  # small delay between batches
 
                 async def _ping_loop():
                     while True:
@@ -127,7 +127,7 @@ async def _ws_worker(
                             channel = obj.get("channel", "")
                             event   = obj.get("event", "")
 
-                            # Пропускаем ack-сообщения и pong
+                            # Skip ack messages and pong
                             if event in ("subscribe", "unsubscribe") or channel == "spot.pong":
                                 continue
                             if event != "update":
@@ -238,10 +238,10 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
     stats         = Stats()
@@ -253,7 +253,7 @@ async def main():
     for _ in sym_chunks:
         stats.connections.append(ConnectionStats())
 
-    logger.info(f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений ({WS_URL})...")
+    logger.info(f"[{script_name}] Starting {len(sym_chunks)} WS connections ({WS_URL})...")
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
     tasks = []
@@ -263,11 +263,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены.")
+    logger.info(f"[{script_name}] All tasks started.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

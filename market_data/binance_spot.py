@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/binance_spot.py — Сборщик best bid/ask с Binance SPOT через WebSocket.
+market_data/binance_spot.py — Binance SPOT best bid/ask collector via WebSocket.
 
 WS URL : wss://stream.binance.com:9443/stream?streams=...
-Канал  : {symbol}@bookTicker  (fastest best bid/ask)
-Чанк   : до 300 стримов на соединение
-Пинг   : встроенный websockets ping_interval
+Channel: {symbol}@bookTicker  (fastest best bid/ask updates)
+Chunk  : up to 300 streams per connection
+Ping   : built-in websockets ping_interval
 """
 
 import asyncio
@@ -33,7 +33,7 @@ WS_BASE    = "wss://stream.binance.com:9443/stream?streams="
 CHUNK_SIZE = 300       # до 300 потоков на WS-соединение
 MAX_RECONNECT_DELAY = 60
 
-# ─── Shared state (заполняются ws-хендлерами, читаются фластерами) ────────────
+# ─── Shared state (written by ws-workers, read by flushers) ──────────────────
 # symbol -> (bid, ask, local_ts)
 _ticker_buf: Dict[str, Tuple[str, str, float]] = {}
 # symbol -> [(local_ts, bid, ask), ...]
@@ -56,8 +56,8 @@ async def _ws_worker(
     stats:      Stats,
 ) -> None:
     """
-    Одно WS-соединение для чанка символов.
-    Автоматически переподключается при обрыве.
+    One WS connection for a symbol chunk.
+    Reconnects automatically on any error.
     """
     url   = _build_url(symbols)
     conn_stats.url = url[:80]
@@ -89,8 +89,7 @@ async def _ws_worker(
                         if not sym or not bid or not ask:
                             continue
 
-                        # Binance bookTicker не содержит exchange-timestamp
-                        # => latency не вычислить; ставим 0
+                        # Binance bookTicker has no exchange timestamp => RTT unavailable
                         stats.record_message(rtt_ms=None, symbol=sym)
                         conn_stats.msgs_total  += 1
                         conn_stats.msgs_window += 1
@@ -122,7 +121,7 @@ async def _ws_worker(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _ticker_flusher(redis_client, stats: Stats, chunk_manager: ChunkManager):
-    """Каждые TICKER_FLUSH_INTERVAL мс пишет накопленные тикеры в Redis через pipeline."""
+    """Every TICKER_FLUSH_INTERVAL seconds flush accumulated tickers to Redis via pipeline."""
     while True:
         await asyncio.sleep(TICKER_FLUSH_INTERVAL)
         if not _ticker_buf:
@@ -148,7 +147,7 @@ async def _ticker_flusher(redis_client, stats: Stats, chunk_manager: ChunkManage
 
 
 async def _history_flusher(redis_client, stats: Stats, chunk_manager: ChunkManager):
-    """Каждую секунду сбрасывает буфер истории в Redis; ротирует чанк при необходимости."""
+    """Every second flush history buffer to Redis; rotate chunk if needed."""
     while True:
         await asyncio.sleep(HISTORY_FLUSH_INTERVAL)
 
@@ -158,7 +157,6 @@ async def _history_flusher(redis_client, stats: Stats, chunk_manager: ChunkManag
         if not _history_buf:
             continue
 
-        # Снять снапшот буфера
         snapshot: Dict[str, List[Tuple[float, str, str]]] = {}
         for sym in list(_history_buf.keys()):
             entries = _history_buf.pop(sym, [])
@@ -192,13 +190,13 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
-    logger.info(f"[{script_name}] Redis: {redis_client.connection_pool.connection_kwargs}")
+    logger.info(f"[{script_name}] Redis connected: {redis_client.connection_pool.connection_kwargs}")
 
     stats         = Stats()
     stats.symbols_tracked = len(symbols)
@@ -210,8 +208,8 @@ async def main():
         stats.connections.append(ConnectionStats())
 
     logger.info(
-        f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений "
-        f"(по {CHUNK_SIZE} символов каждое)..."
+        f"[{script_name}] Starting {len(sym_chunks)} WS connections "
+        f"({CHUNK_SIZE} symbols each)..."
     )
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
@@ -224,11 +222,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены. Символов: {len(symbols)}.")
+    logger.info(f"[{script_name}] All tasks started. Symbols: {len(symbols)}.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение по запросу.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

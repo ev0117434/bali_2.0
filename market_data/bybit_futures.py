@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/bybit_futures.py — Сборщик best bid/ask с Bybit FUTURES (Linear/USDT) через WebSocket.
+market_data/bybit_futures.py — Bybit FUTURES (Linear/USDT) best bid/ask collector via WebSocket.
 
 WS URL  : wss://stream.bybit.com/v5/public/linear
-Канал   : orderbook.1.{SYMBOL}
-Подписка: до 200 символов в одном subscribe-сообщении (Bybit Linear)
-Пинг    : {"op":"ping"} каждые 20 сек
+Channel : orderbook.1.{SYMBOL}
+Subscribe: up to 200 symbols per subscribe message (Bybit Linear)
+Ping    : {"op":"ping"} every 20 s
 """
 
 import asyncio
@@ -29,8 +29,8 @@ from common import (
 EXCHANGE   = "bybit"
 MARKET     = "futures"
 WS_URL     = "wss://stream.bybit.com/v5/public/linear"
-CHUNK_SIZE = 200   # символов на одно WS-соединение
-SUB_BATCH  = 200   # символов в одном subscribe-сообщении (для linear больше лимит)
+CHUNK_SIZE = 200   # symbols per WS connection
+SUB_BATCH  = 200   # symbols per subscribe message (linear allows higher limit)
 PING_INTERVAL = 20
 MAX_RECONNECT_DELAY = 60
 
@@ -186,10 +186,10 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
     stats         = Stats()
@@ -201,7 +201,7 @@ async def main():
     for _ in sym_chunks:
         stats.connections.append(ConnectionStats())
 
-    logger.info(f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений ({WS_URL})...")
+    logger.info(f"[{script_name}] Starting {len(sym_chunks)} WS connections ({WS_URL})...")
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
     tasks = []
@@ -211,11 +211,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены.")
+    logger.info(f"[{script_name}] All tasks started.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

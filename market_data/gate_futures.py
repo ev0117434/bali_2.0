@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/gate_futures.py — Сборщик best bid/ask с Gate.io FUTURES (USDT-Margined) через WebSocket.
+market_data/gate_futures.py — Gate.io FUTURES (USDT-Margined) best bid/ask collector via WebSocket.
 
 WS URL  : wss://fx-ws.gateio.ws/v4/ws/usdt
-Канал   : futures.book_ticker
-Подписка: батчи по 100 символов в одном payload
-Пинг    : {"channel":"futures.ping","time":<ts>} каждые 25 сек
+Channel : futures.book_ticker
+Subscribe: batches of 100 symbols per payload
+Ping    : {"channel":"futures.ping","time":<ts>} every 25 s
 
-Формат символов:
-  Файл подписки: BTCUSDT
-  Gate.io WS:   BTC_USDT
-  Redis:        BTCUSDT
+Symbol format:
+  Subscribe file: BTCUSDT
+  Gate.io WS:    BTC_USDT
+  Redis:         BTCUSDT
 
-Формат данных:
+Message fields:
   result.b  = best bid price
   result.a  = best ask price
-  result.t  = exchange timestamp (мс)
+  result.t  = exchange timestamp (ms)
   result.s  = symbol (BTC_USDT)
 """
 
@@ -231,10 +231,10 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
     stats         = Stats()
@@ -246,7 +246,7 @@ async def main():
     for _ in sym_chunks:
         stats.connections.append(ConnectionStats())
 
-    logger.info(f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений ({WS_URL})...")
+    logger.info(f"[{script_name}] Starting {len(sym_chunks)} WS connections ({WS_URL})...")
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
     tasks = []
@@ -256,11 +256,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены.")
+    logger.info(f"[{script_name}] All tasks started.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

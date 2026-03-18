@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/binance_futures.py — Сборщик best bid/ask с Binance FUTURES (USD-M) через WebSocket.
+market_data/binance_futures.py — Binance FUTURES (USD-M) best bid/ask collector via WebSocket.
 
 WS URL : wss://fstream.binance.com/stream?streams=...
-Канал  : {symbol}@bookTicker  (fastest best bid/ask)
-Чанк   : до 300 стримов на соединение
-Пинг   : встроенный websockets ping_interval
+Channel: {symbol}@bookTicker  (fastest best bid/ask updates)
+Chunk  : up to 300 streams per connection
+Ping   : built-in websockets ping_interval
 """
 
 import asyncio
@@ -158,10 +158,10 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
     stats         = Stats()
@@ -173,7 +173,7 @@ async def main():
     for _ in sym_chunks:
         stats.connections.append(ConnectionStats())
 
-    logger.info(f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений...")
+    logger.info(f"[{script_name}] Starting {len(sym_chunks)} WS connections...")
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
     tasks = []
@@ -183,11 +183,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены. Символов: {len(symbols)}.")
+    logger.info(f"[{script_name}] All tasks started. Symbols: {len(symbols)}.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

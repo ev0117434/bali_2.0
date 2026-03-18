@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/bybit_spot.py — Сборщик best bid/ask с Bybit SPOT через WebSocket.
+market_data/bybit_spot.py — Bybit SPOT best bid/ask collector via WebSocket.
 
 WS URL  : wss://stream.bybit.com/v5/public/spot
-Канал   : orderbook.1.{SYMBOL}   (L1 — только лучший бид/аск)
-Подписка: до 10 символов в одном subscribe-сообщении
-Пинг    : {"op":"ping"} каждые 20 сек
+Channel : orderbook.1.{SYMBOL}  (L1 — best bid/ask only)
+Subscribe: up to 10 symbols per subscribe message
+Ping    : {"op":"ping"} every 20 s
 
-Формат топика ответа: orderbook.1.BTCUSDT
+Response topic: orderbook.1.BTCUSDT
 data.b[0][0] = best bid price
 data.a[0][0] = best ask price
-ts            = exchange timestamp (мс)
+ts           = exchange timestamp (ms)
 """
 
 import asyncio
@@ -34,8 +34,8 @@ from common import (
 EXCHANGE   = "bybit"
 MARKET     = "spot"
 WS_URL     = "wss://stream.bybit.com/v5/public/spot"
-CHUNK_SIZE = 200   # символов на одно WS-соединение
-SUB_BATCH  = 10    # символов в одном subscribe-сообщении (рекомендация Bybit Spot)
+CHUNK_SIZE = 200   # symbols per WS connection
+SUB_BATCH  = 10    # symbols per subscribe message (Bybit Spot recommendation)
 PING_INTERVAL   = 20
 MAX_RECONNECT_DELAY = 60
 
@@ -62,7 +62,7 @@ async def _ws_worker(
                 conn_stats.active = True
                 delay = 1
 
-                # Подписываемся батчами по SUB_BATCH
+                # Subscribe in batches of SUB_BATCH
                 for batch in chunk_list(symbols, SUB_BATCH):
                     args = [f"orderbook.1.{s}" for s in batch]
                     await ws.send(json.dumps({"op": "subscribe", "args": args}))
@@ -86,7 +86,7 @@ async def _ws_worker(
                         recv_ts = time.time()
                         try:
                             obj = json.loads(raw)
-                            # Фильтруем служебные сообщения
+                            # Skip control messages
                             if obj.get("op") in ("subscribe", "ping", "pong"):
                                 continue
                             topic = obj.get("topic", "")
@@ -105,7 +105,7 @@ async def _ws_worker(
                             bq  = str(bids[0][1]) if len(bids[0]) > 1 else "0"
                             aq  = str(asks[0][1]) if len(asks[0]) > 1 else "0"
 
-                            # Exchange timestamp (мс)
+                            # Exchange timestamp (ms)
                             ex_ts_ms = obj.get("ts", 0)
                             latency_ms = (recv_ts * 1000 - ex_ts_ms) if ex_ts_ms else 0.0
 
@@ -198,10 +198,10 @@ async def main():
     log_mgr = LogManager(script_name)
     log_mgr.initialize()
     logger  = log_mgr.get_logger()
-    logger.info(f"[{script_name}] Запуск...")
+    logger.info(f"[{script_name}] Starting...")
 
     symbols = load_symbols(EXCHANGE, MARKET)
-    logger.info(f"[{script_name}] Загружено {len(symbols)} символов")
+    logger.info(f"[{script_name}] Loaded {len(symbols)} symbols")
 
     redis_client  = await create_redis()
     stats         = Stats()
@@ -213,7 +213,7 @@ async def main():
     for _ in sym_chunks:
         stats.connections.append(ConnectionStats())
 
-    logger.info(f"[{script_name}] Запускаю {len(sym_chunks)} WS-соединений ({WS_URL})...")
+    logger.info(f"[{script_name}] Starting {len(sym_chunks)} WS connections ({WS_URL})...")
 
     snap_logger = SnapshotLogger(script_name, log_mgr, stats, chunk_manager)
     tasks = []
@@ -223,11 +223,11 @@ async def main():
     tasks.append(asyncio.create_task(_history_flusher(redis_client, stats, chunk_manager)))
     tasks.append(asyncio.create_task(snap_logger.run()))
 
-    logger.info(f"[{script_name}] Все задачи запущены.")
+    logger.info(f"[{script_name}] All tasks started.")
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"[{script_name}] Завершение.")
+        logger.info(f"[{script_name}] Shutting down.")
     finally:
         snap_logger.stop()
         await redis_client.aclose()

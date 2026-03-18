@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_data/common.py — Общие утилиты для сборщиков рыночных данных.
+market_data/common.py — Shared utilities for market data collectors.
 
-Содержит:
-- Stats / ConnectionStats  : статистика для снапшотов
-- LogManager               : ротация лог-файлов (24ч-чанки, хранить 2)
-- ChunkManager             : 20-мин чанки истории цен в Redis (хранить 5)
-- SnapshotLogger           : снапшот каждые 10 секунд
-- create_redis()           : async Redis-клиент
-- load_symbols()           : чтение списка символов из subscribe-файла
-- chunk_list()             : разбивка списка на чанки
+Contains:
+- Stats / ConnectionStats  : per-window statistics for snapshots
+- LogManager               : rotating log files (24h chunks, keep 2)
+- ChunkManager             : 20-min price-history chunks in Redis (keep 5)
+- SnapshotLogger           : JSON-Lines snapshot every 10 seconds
+- create_redis()           : async Redis client with retry
+- load_symbols()           : load symbol list from subscribe file
+- chunk_list()             : split list into equal chunks
 """
 
 import asyncio
@@ -27,16 +27,52 @@ from typing import Any, Dict, List, Optional, Set
 
 import redis.asyncio as aioredis
 
-# Принудительно выставляем UTF-8 для stdout/stderr (актуально при запуске
-# через run_all.py или в окружениях без локали UTF-8)
+# Force UTF-8 on stdout/stderr (needed when launched via run_all.py subprocess
+# or in environments without a UTF-8 locale)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JSON-Lines log formatter
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _JsonFormatter(logging.Formatter):
+    """
+    Formats every log record as a single JSON object (JSON Lines).
+
+    Regular messages:
+        {"ts":"2026-03-18T16:33:07.886Z","script":"binance_spot","level":"INFO","msg":"Starting..."}
+
+    Snapshot entries produced by SnapshotLogger are already complete JSON
+    objects; they are passed through unchanged so the log file stays valid
+    JSON Lines throughout.
+    """
+
+    def __init__(self, script_name: str):
+        super().__init__()
+        self._script = script_name
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        # SnapshotLogger emits a pre-built JSON object — pass it through as-is
+        if msg.startswith("{") and msg.endswith("}"):
+            return msg
+        ts = (
+            datetime.utcfromtimestamp(record.created).strftime("%Y-%m-%dT%H:%M:%S.")
+            + f"{int(record.msecs):03d}Z"
+        )
+        return json.dumps(
+            {"ts": ts, "script": self._script, "level": record.levelname, "msg": msg},
+            ensure_ascii=False,
+        )
+
+
 # ─── Paths ────────────────────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LOGS_DIR     = PROJECT_ROOT / "logs"
+PROJECT_ROOT  = Path(__file__).resolve().parent.parent
+LOGS_DIR      = PROJECT_ROOT / "logs"
 SUBSCRIBE_DIR = PROJECT_ROOT / "dictionaries" / "subscribe"
 
 # ─── Redis ────────────────────────────────────────────────────────────────────
@@ -46,15 +82,15 @@ REDIS_DB       = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
 # ─── Timings ──────────────────────────────────────────────────────────────────
-HISTORY_CHUNK_SECONDS  = 20 * 60   # 20 минут — один чанк истории
-HISTORY_MAX_CHUNKS     = 5         # Хранить последние 5 чанков
+HISTORY_CHUNK_SECONDS  = 20 * 60        # 20 minutes per history chunk
+HISTORY_MAX_CHUNKS     = 5             # keep last 5 chunks
 
-LOG_CHUNK_SECONDS      = 24 * 60 * 60  # 24 часа — один лог-чанк
-LOG_MAX_CHUNKS         = 2             # Хранить последние 2 завершённых чанка
+LOG_CHUNK_SECONDS      = 24 * 60 * 60  # 24 hours per log chunk
+LOG_MAX_CHUNKS         = 2             # keep last 2 completed chunks
 
-SNAPSHOT_INTERVAL      = 10    # секунд между снапшотами
-TICKER_FLUSH_INTERVAL  = 0.05  # секунд между пакетными записями тикеров (50ms)
-HISTORY_FLUSH_INTERVAL = 1.0   # секунд между пакетными записями истории
+SNAPSHOT_INTERVAL      = 10    # seconds between snapshots
+TICKER_FLUSH_INTERVAL  = 0.05  # seconds between ticker batch writes (50 ms)
+HISTORY_FLUSH_INTERVAL = 1.0   # seconds between history batch writes
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -63,19 +99,19 @@ HISTORY_FLUSH_INTERVAL = 1.0   # секунд между пакетными за
 
 @dataclass
 class ConnectionStats:
-    url:          str   = ""
-    active:       bool  = False
-    msgs_total:   int   = 0
-    msgs_window:  int   = 0
-    last_msg_ts:  float = 0.0
-    reconnects:   int   = 0
-    last_error:   str   = ""
+    url:           str   = ""
+    active:        bool  = False
+    msgs_total:    int   = 0
+    msgs_window:   int   = 0
+    last_msg_ts:   float = 0.0
+    reconnects:    int   = 0
+    last_error:    str   = ""
     last_error_ts: float = 0.0
 
 
 @dataclass
 class Stats:
-    start_ts: float = field(default_factory=time.time)
+    start_ts:    float = field(default_factory=time.time)
     connections: List[ConnectionStats] = field(default_factory=list)
 
     msgs_total:   int = 0
@@ -87,11 +123,11 @@ class Stats:
     history_entries_total:  int = 0
     history_entries_window: int = 0
 
-    # RTT: exchange_timestamp → recv_ts  (сетевая задержка биржа→скрипт)
-    # Недоступна для Binance bookTicker (нет exchange timestamp в потоке)
+    # RTT: exchange_timestamp → recv_ts  (network latency exchange→script)
+    # Not available for Binance bookTicker (no exchange timestamp in stream)
     rtt_latencies_window:  List[float] = field(default_factory=list)
 
-    # Internal: recv_ts → redis write complete  (время в буфере + pipeline)
+    # Internal: recv_ts → redis write complete  (buffer time + pipeline)
     proc_latencies_window: List[float] = field(default_factory=list)
 
     symbols_active_window: Set[str] = field(default_factory=set)
@@ -120,7 +156,7 @@ class Stats:
             self.symbols_active_window.add(symbol)
 
     def record_proc_latency(self, ms: float):
-        """Вызывается из ticker_flusher после записи pipeline в Redis."""
+        """Called from ticker_flusher after pipeline write completes."""
         if ms > 0:
             self.proc_latencies_window.append(ms)
 
@@ -144,10 +180,9 @@ class Stats:
 
 class LogManager:
     """
-    Ротация лог-файлов.
-    - Один чанк = 24 ч; папка формата  YYYYMMDD_HHMMSS-YYYYMMDD_HHMMSS
-    - Хранить LOG_MAX_CHUNKS завершённых чанков; при открытии нового
-      (N+1)-го чанка удалять самый старый.
+    Rotating log files — JSON Lines format.
+    - One chunk = 24 h; directory name: YYYYMMDD_HHMMSS-YYYYMMDD_HHMMSS
+    - Keep LOG_MAX_CHUNKS completed chunks; delete oldest when (N+1)-th opens.
     """
 
     def __init__(self, script_name: str):
@@ -155,10 +190,10 @@ class LogManager:
         self.log_dir_root = LOGS_DIR / script_name
         self.log_dir_root.mkdir(parents=True, exist_ok=True)
 
-        self._current_dir:  Optional[Path]           = None
-        self._current_start_ts: float                = 0.0
-        self._logger:       Optional[logging.Logger] = None
-        self._completed_dirs: List[Path]             = []
+        self._current_dir:      Optional[Path]           = None
+        self._current_start_ts: float                    = 0.0
+        self._logger:           Optional[logging.Logger] = None
+        self._completed_dirs:   List[Path]               = []
 
     # ── internal ─────────────────────────────────────────────────────────────
 
@@ -167,7 +202,7 @@ class LogManager:
         return datetime.utcfromtimestamp(ts).strftime("%Y%m%d_%H%M%S")
 
     def _scan_completed(self):
-        """Найти и отсортировать папки завершённых чанков."""
+        """Find and sort directories of completed chunks."""
         dirs = sorted(
             [d for d in self.log_dir_root.iterdir()
              if d.is_dir() and "-" in d.name and "ongoing" not in d.name],
@@ -176,7 +211,7 @@ class LogManager:
         self._completed_dirs = dirs
 
     def _close_current(self):
-        """Закрыть текущий чанк: сбросить хендлер и переименовать папку."""
+        """Close current chunk: flush handlers and rename directory."""
         if self._logger:
             for h in self._logger.handlers[:]:
                 try:
@@ -216,14 +251,16 @@ class LogManager:
                 pass
             logger.removeHandler(h)
 
+        fmt = _JsonFormatter(self.script_name)
+
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter("%(message)s"))
+        fh.setFormatter(fmt)
         logger.addHandler(fh)
 
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.INFO)
-        ch.setFormatter(logging.Formatter("%(message)s"))
+        ch.setFormatter(fmt)
         logger.addHandler(ch)
 
         # Prevent propagation to root logger
@@ -231,7 +268,7 @@ class LogManager:
         self._logger = logger
 
     def _purge_old_chunks(self):
-        """Удалить самые старые чанки сверх лимита."""
+        """Delete oldest chunks that exceed LOG_MAX_CHUNKS."""
         self._scan_completed()
         while len(self._completed_dirs) > LOG_MAX_CHUNKS:
             old = self._completed_dirs.pop(0)
@@ -273,23 +310,23 @@ class LogManager:
 
 class ChunkManager:
     """
-    Управляет 20-минутными чанками истории цен в Redis.
+    Manages 20-minute price-history chunks in Redis.
 
-    Схема ключей:
-      {prefix}:history:{symbol}:{chunk_id}   — Redis List, элементы "{ts},{bid},{ask}"
-      {prefix}:chunks:config                 — JSON-строка с метаданными чанков
+    Key schema:
+      md:hist:{exchange}:{market}:{symbol}:{chunk_id}  — Redis List, items "{ts},{bid},{ask}"
+      md:chunks:config                                 — Hash, field per exchange:market
 
-    Логика ротации:
-      - Хранить HISTORY_MAX_CHUNKS = 5 чанков.
-      - При создании 6-го удалять 1-й, при создании 7-го — 2-й и т.д.
+    Rotation logic:
+      Keep HISTORY_MAX_CHUNKS = 5 chunks.
+      When chunk N+1 is created, chunk N-4 is deleted.
     """
 
     def __init__(self, exchange: str, market: str, redis_client: aioredis.Redis):
         self.exchange = exchange
         self.market   = market
         self.redis    = redis_client
-        self.field_key  = f"{exchange}:{market}"    # поле в глобальном Hash
-        self.config_key = "md:chunks:config"          # один ключ на всю систему
+        self.field_key  = f"{exchange}:{market}"   # field in global Hash
+        self.config_key = "md:chunks:config"        # single key for the whole system
 
         self.current_chunk_id: int          = 0
         self.chunk_start_ts:   float        = 0.0
@@ -303,7 +340,7 @@ class ChunkManager:
     # ── internal ─────────────────────────────────────────────────────────────
 
     async def _save(self):
-        """Сохраняет конфиг своего exchange:market в глобальный Hash md:chunks:config."""
+        """Persist this exchange:market config into global Hash md:chunks:config."""
         config = {
             "current_chunk_id": self.current_chunk_id,
             "active_chunks":    self.active_chunks,
@@ -347,7 +384,7 @@ class ChunkManager:
                 self.chunk_meta       = {str(k): v for k, v in cfg["chunks"].items()}
                 meta = self.chunk_meta.get(str(self.current_chunk_id), {})
                 self.chunk_start_ts   = meta.get("start_ts", 0.0)
-                # Если текущий чанк уже истёк — сразу ротируем
+                # If current chunk has already expired — rotate immediately
                 if time.time() - self.chunk_start_ts >= HISTORY_CHUNK_SECONDS:
                     await self.rotate()
                 return
@@ -357,8 +394,8 @@ class ChunkManager:
 
     async def rotate(self):
         """
-        Закрыть текущий чанк, открыть новый.
-        Если активных чанков > HISTORY_MAX_CHUNKS — удалить самый старый.
+        Close current chunk, open a new one.
+        If active chunks exceed HISTORY_MAX_CHUNKS — delete the oldest.
         """
         now = time.time()
         cid = str(self.current_chunk_id)
@@ -372,7 +409,7 @@ class ChunkManager:
         self.active_chunks.append(self.current_chunk_id)
         self.chunk_meta[new_cid] = {"start_ts": now, "start_dt": self._dt_str(now)}
 
-        # Удалить самый старый, если превысили лимит
+        # Delete oldest chunk if over limit
         if len(self.active_chunks) > HISTORY_MAX_CHUNKS:
             old_id = self.active_chunks.pop(0)
             self.chunk_meta.pop(str(old_id), None)
@@ -396,15 +433,16 @@ class ChunkManager:
         return max(0.0, HISTORY_CHUNK_SECONDS - self.elapsed())
 
     def config_summary(self) -> str:
+        """Human-readable chunk status (used in debugging)."""
         lines = [
-            f"  Chunk #{self.current_chunk_id}: запущен {self.elapsed():.0f}s назад, "
-            f"осталось ~{self.remaining():.0f}s",
-            f"  Активные чанки: {self.active_chunks}",
+            f"  Chunk #{self.current_chunk_id}: started {self.elapsed():.0f}s ago, "
+            f"~{self.remaining():.0f}s remaining",
+            f"  Active chunks: {self.active_chunks}",
         ]
         for cid_str, meta in sorted(self.chunk_meta.items(), key=lambda x: int(x[0])):
             start = meta.get("start_dt", "?")
-            end   = meta.get("end_dt", "(текущий)")
-            lines.append(f"    Чанк {cid_str}: {start} → {end}")
+            end   = meta.get("end_dt", "(current)")
+            lines.append(f"    Chunk {cid_str}: {start} -> {end}")
         return "\n".join(lines)
 
 
@@ -413,7 +451,7 @@ class ChunkManager:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SnapshotLogger:
-    """Выводит снапшот статистики каждые SNAPSHOT_INTERVAL секунд."""
+    """Emits a JSON-Lines snapshot every SNAPSHOT_INTERVAL seconds."""
 
     def __init__(
         self,
@@ -430,13 +468,6 @@ class SnapshotLogger:
         self._running      = False
 
     @staticmethod
-    def _fmt_uptime(seconds: float) -> str:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        return f"{h}h {m:02d}m {s:02d}s"
-
-    @staticmethod
     def _percentile(data: List[float], pct: float) -> float:
         if not data:
             return 0.0
@@ -445,83 +476,77 @@ class SnapshotLogger:
         return sd[idx]
 
     def _build(self, elapsed: float) -> str:
+        """Return a single JSON-Lines string representing the current snapshot."""
         s   = self.stats
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
-
-        active_conn = sum(1 for c in s.connections if c.active)
-        total_conn  = len(s.connections)
+        now = time.time()
+        ts  = (
+            datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%S.")
+            + f"{int((now % 1) * 1000):03d}Z"
+        )
 
         rate_msg  = s.msgs_window  / elapsed if elapsed > 0 else 0.0
         rate_tick = s.ticker_writes_window / elapsed if elapsed > 0 else 0.0
         rate_hist = s.history_entries_window / elapsed if elapsed > 0 else 0.0
 
-        rtt  = s.rtt_latencies_window
-        proc = s.proc_latencies_window
+        def _lat(data: List[float]) -> Dict[str, Any]:
+            if not data:
+                return {"samples": 0, "min_ms": None, "avg_ms": None,
+                        "p95_ms": None, "max_ms": None}
+            return {
+                "samples": len(data),
+                "min_ms":  round(min(data), 2),
+                "avg_ms":  round(sum(data) / len(data), 2),
+                "p95_ms":  round(self._percentile(data, 95), 2),
+                "max_ms":  round(max(data), 2),
+            }
 
-        lines = [
-            "=" * 66,
-            f"SNAPSHOT  {self.script_name:<20}  {now}",
-            "=" * 66,
-            f"Uptime: {self._fmt_uptime(time.time() - s.start_ts)}",
-            "",
-            f"СОЕДИНЕНИЯ ({active_conn}/{total_conn} активных)",
-        ]
-        for i, c in enumerate(s.connections, 1):
-            status = "✓ ALIVE" if c.active else "✗ DEAD "
-            url_short = (c.url[:52] + "…") if len(c.url) > 53 else c.url
-            lines.append(
-                f"  Conn-{i:02d}: [{status}]  msgs={c.msgs_total:,}  "
-                f"last={c.msgs_window} msg/{SNAPSHOT_INTERVAL}s  url={url_short}"
-            )
-            if c.last_error:
-                err_dt = datetime.utcfromtimestamp(c.last_error_ts).strftime("%H:%M:%S")
-                lines.append(f"          ↳ err: {c.last_error[:80]}  @ {err_dt}")
-
-        lines += [
-            "",
-            "ПРОПУСКНАЯ СПОСОБНОСТЬ",
-            f"  Сообщений:      {s.msgs_total:>12,}  |  {rate_msg:>8.1f} msg/s",
-            f"  Ticker writes:  {s.ticker_writes_total:>12,}  |  {rate_tick:>8.1f} wr/s",
-            f"  History ent.:   {s.history_entries_total:>12,}  |  {rate_hist:>8.1f} ent/s",
-            "",
-            "СИМВОЛЫ",
-            f"  Отслеживается:  {s.symbols_tracked}",
-            f"  Активных за {SNAPSHOT_INTERVAL}s: {len(s.symbols_active_window)}",
-            "",
-            "ЗАДЕРЖКИ",
-        ]
-        # RTT (биржа → скрипт)
-        if rtt:
-            lines.append(
-                f"  RTT (exchange→recv)  [{len(rtt):>5} сэмплов]:  "
-                f"min={min(rtt):.2f}  avg={sum(rtt)/len(rtt):.2f}  "
-                f"p95={self._percentile(rtt,95):.2f}  max={max(rtt):.2f} ms"
-            )
-        else:
-            lines.append("  RTT (exchange→recv)  — нет данных (биржа не даёт timestamp)")
-        # Internal (recv → redis write)
-        if proc:
-            lines.append(
-                f"  Internal (recv→Redis)[{len(proc):>5} сэмплов]:  "
-                f"min={min(proc):.2f}  avg={sum(proc)/len(proc):.2f}  "
-                f"p95={self._percentile(proc,95):.2f}  max={max(proc):.2f} ms"
-            )
-        else:
-            lines.append("  Internal (recv→Redis) — нет данных")
+        obj: Dict[str, Any] = {
+            "ts":       ts,
+            "script":   self.script_name,
+            "type":     "snapshot",
+            "uptime_s": int(now - s.start_ts),
+            "connections": [
+                {
+                    "id":          i + 1,
+                    "status":      "alive" if c.active else "dead",
+                    "msgs_total":  c.msgs_total,
+                    "msgs_window": c.msgs_window,
+                    "reconnects":  c.reconnects,
+                    "last_error":  c.last_error or None,
+                    "url":         c.url,
+                }
+                for i, c in enumerate(s.connections)
+            ],
+            "throughput": {
+                "msgs_total":             s.msgs_total,
+                "msgs_per_s":             round(rate_msg, 1),
+                "ticker_writes_total":    s.ticker_writes_total,
+                "ticker_writes_per_s":    round(rate_tick, 1),
+                "history_entries_total":  s.history_entries_total,
+                "history_entries_per_s":  round(rate_hist, 1),
+            },
+            "symbols": {
+                "tracked":       s.symbols_tracked,
+                "active_window": len(s.symbols_active_window),
+            },
+            "latency": {
+                "rtt":  _lat(s.rtt_latencies_window),
+                "proc": _lat(s.proc_latencies_window),
+            },
+            "reconnects_total": s.reconnects_total,
+            "last_error":       s.last_error or None,
+        }
 
         if self.chunk_manager:
-            lines += ["", "REDIS HISTORY ЧАНКИ"]
-            lines.append(self.chunk_manager.config_summary())
+            cm = self.chunk_manager
+            obj["history_chunk"] = {
+                "chunk_id":      cm.current_chunk_id,
+                "elapsed_s":     int(cm.elapsed()),
+                "remaining_s":   int(cm.remaining()),
+                "active_chunks": cm.active_chunks,
+            }
 
-        if s.reconnects_total:
-            lines.append("")
-            lines.append(f"РЕКОННЕКТЫ: {s.reconnects_total} всего")
-        if s.last_error:
-            err_dt = datetime.utcfromtimestamp(s.last_error_ts).strftime("%Y-%m-%d %H:%M:%S UTC")
-            lines.append(f"Последняя ошибка: {s.last_error}  @ {err_dt}")
-
-        lines.append("=" * 66)
-        return "\n".join(lines)
+        return json.dumps(obj, ensure_ascii=False)
 
     async def run(self):
         self._running = True
@@ -545,7 +570,7 @@ class SnapshotLogger:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def create_redis() -> aioredis.Redis:
-    """Создаёт async Redis-клиент с ретраями."""
+    """Create async Redis client with exponential-backoff retry (5 attempts)."""
     for attempt in range(5):
         try:
             client = aioredis.Redis(
@@ -564,14 +589,14 @@ async def create_redis() -> aioredis.Redis:
             if attempt < 4:
                 await asyncio.sleep(2 ** attempt)
             else:
-                raise RuntimeError(f"Не удалось подключиться к Redis: {e}") from e
+                raise RuntimeError(f"Failed to connect to Redis: {e}") from e
 
 
 def load_symbols(exchange: str, market: str) -> List[str]:
-    """Загрузить список символов из dictionaries/subscribe/{exchange}/{exchange}_{market}.txt"""
+    """Load symbol list from dictionaries/subscribe/{exchange}/{exchange}_{market}.txt"""
     path = SUBSCRIBE_DIR / exchange / f"{exchange}_{market}.txt"
     if not path.exists():
-        raise FileNotFoundError(f"Subscribe-файл не найден: {path}")
+        raise FileNotFoundError(f"Subscribe file not found: {path}")
     return [
         line.strip().upper()
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -580,5 +605,5 @@ def load_symbols(exchange: str, market: str) -> List[str]:
 
 
 def chunk_list(lst: list, n: int) -> List[list]:
-    """Разбить список на подсписки по n элементов."""
+    """Split list into sublists of at most n elements."""
     return [lst[i: i + n] for i in range(0, len(lst), n)]
