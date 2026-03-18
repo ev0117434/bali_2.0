@@ -1,4 +1,4 @@
-# User Guide — Скрипты сборщиков
+# Руководство пользователя — скрипты сборщиков
 
 ## Общие принципы
 
@@ -64,17 +64,17 @@ SOLUSDT
 
 ---
 
-## Reading Output — JSON Lines Snapshots (every 10s)
+## Вывод — снапшоты в формате JSON Lines (каждые 10с)
 
-Every 10 seconds each script writes a snapshot line to stdout and to its log file.
-Use `jq` for pretty-printing:
+Каждые 10 секунд каждый скрипт записывает строку-снапшот в stdout и в лог-файл.
+Для удобного просмотра используйте `jq`:
 
 ```bash
 tail -f logs/binance_spot/$(ls -t logs/binance_spot/ | head -1)/binance_spot.log \
   | grep --line-buffered '"type":"snapshot"' | jq .
 ```
 
-Example (pretty-printed):
+Пример (форматированный):
 
 ```json
 {
@@ -102,59 +102,59 @@ Example (pretty-printed):
 }
 ```
 
-| Field                          | Meaning                                         |
-|--------------------------------|-------------------------------------------------|
-| `throughput.msgs_per_s`        | WS messages/s in the last 10-second window      |
-| `throughput.ticker_writes_per_s` | Redis ticker writes/s                         |
-| `throughput.history_entries_per_s` | History RPUSH entries/s                   |
-| `latency.rtt`                  | Exchange timestamp → script receive (RTT)       |
-| `latency.proc`                 | Script receive → Redis write complete           |
-| `history_chunk.chunk_id`       | Current 20-minute history chunk number          |
-| `history_chunk.remaining_s`    | Seconds until next chunk rotation               |
+| Поле                               | Описание                                             |
+|------------------------------------|------------------------------------------------------|
+| `throughput.msgs_per_s`            | WS-сообщений/с за последнее 10с окно                 |
+| `throughput.ticker_writes_per_s`   | Записей тикеров в Redis/с                            |
+| `throughput.history_entries_per_s` | Записей истории (RPUSH)/с                            |
+| `latency.rtt`                      | Exchange timestamp → приём в скрипте (RTT)           |
+| `latency.proc`                     | Приём в скрипте → завершение записи в Redis          |
+| `history_chunk.chunk_id`           | Номер текущего 20-минутного чанка истории            |
+| `history_chunk.remaining_s`        | Секунд до следующей ротации чанка                    |
 
-> **Note:** `latency.rtt` samples = 0 for Binance — no exchange timestamp in bookTicker.
-
----
-
-## Error Behavior
-
-### WebSocket connection dropped
-
-Script reconnects automatically with exponential backoff:
-
-```
-Connection dropped -> wait 1s -> reconnect
-Dropped again      -> wait 2s -> reconnect
-Dropped again      -> wait 4s -> reconnect
-...
-Maximum            -> 60s between attempts
-```
-
-If the connection was alive ≥ 60s — delay resets to 1s.
-
-Reconnect counter visible in snapshot: `connections[].reconnects`.
-
-### Whole script crash (run_all.py only)
-
-`run_all.py` monitors processes and restarts with the same logic:
-
-```
-Process exited -> wait 1s -> restart
-...
-Maximum        -> 120s between attempts
-```
-
-If process lived ≥ 300s — delay resets to 1s.
-
-### Redis unavailable at startup
-
-Script retries 5 times with exponential backoff (1s → 2s → 4s → 8s → 16s), then exits with error.
+> **Примечание:** `latency.rtt` samples = 0 для Binance — bookTicker не содержит timestamp биржи.
 
 ---
 
-## Verifying Data is Flowing
+## Поведение при ошибках
 
-### Check a ticker
+### Обрыв WebSocket-соединения
+
+Скрипт переподключается автоматически с экспоненциальной выдержкой:
+
+```
+Обрыв              -> ждать 1s -> переподключение
+Повторный обрыв    -> ждать 2s -> переподключение
+Ещё раз            -> ждать 4s -> переподключение
+...
+Максимум           -> 60s между попытками
+```
+
+Если соединение держалось ≥ 60с — задержка сбрасывается до 1s.
+
+Счётчик переподключений виден в снапшоте: `connections[].reconnects`.
+
+### Падение всего скрипта (только run_all.py)
+
+`run_all.py` следит за процессами и перезапускает по той же логике:
+
+```
+Процесс упал -> ждать 1s -> перезапуск
+...
+Максимум     -> 120s между попытками
+```
+
+Если процесс прожил ≥ 300с — задержка сбрасывается до 1s.
+
+### Redis недоступен при старте
+
+Скрипт делает 5 попыток с экспоненциальной выдержкой (1s → 2s → 4s → 8s → 16s), затем завершается с ошибкой.
+
+---
+
+## Проверка работы
+
+### Проверить тикер
 
 ```bash
 redis-cli HGETALL md:binance:spot:BTCUSDT
@@ -166,7 +166,7 @@ redis-cli HGETALL md:binance:spot:BTCUSDT
 # 6) "1710000000.123"
 ```
 
-### Check history
+### Проверить историю
 
 ```bash
 redis-cli LRANGE md:hist:binance:spot:BTCUSDT:1 0 4
@@ -175,13 +175,13 @@ redis-cli LRANGE md:hist:binance:spot:BTCUSDT:1 0 4
 # ...
 ```
 
-### Count keys in Redis
+### Подсчитать ключи в Redis
 
 ```bash
 redis-cli --scan --pattern 'md:*' | wc -l
 ```
 
-### Confirm data is updating
+### Убедиться, что данные обновляются
 
 ```bash
 watch -n 1 'redis-cli HGET md:bybit:spot:BTCUSDT ts'
@@ -189,18 +189,18 @@ watch -n 1 'redis-cli HGET md:bybit:spot:BTCUSDT ts'
 
 ---
 
-## Per-Script Details
+## Особенности отдельных скриптов
 
 ---
 
 ### binance_spot.py
 
 **WebSocket:** `wss://stream.binance.com:9443/stream?streams=...`
-**Channel:** `{symbol}@bookTicker` — fastest best bid/ask updates
-**Limit:** 300 symbols per connection
-**RTT:** not available (Binance bookTicker has no exchange timestamp)
+**Канал:** `{symbol}@bookTicker` — самые быстрые обновления best bid/ask
+**Лимит:** 300 символов на соединение
+**RTT:** недоступен (Binance bookTicker не содержит timestamp биржи)
 
-Subscription is embedded directly in the URL:
+Подписка встроена прямо в URL:
 ```
 wss://...?streams=btcusdt@bookTicker/ethusdt@bookTicker/...
 ```
@@ -210,20 +210,20 @@ wss://...?streams=btcusdt@bookTicker/ethusdt@bookTicker/...
 ### binance_futures.py
 
 **WebSocket:** `wss://fstream.binance.com/stream?streams=...`
-**Channel:** `{symbol}@bookTicker`
-Identical to `binance_spot.py`, differs only in host.
+**Канал:** `{symbol}@bookTicker`
+Идентичен `binance_spot.py`, отличается только хостом.
 
 ---
 
 ### bybit_spot.py
 
 **WebSocket:** `wss://stream.bybit.com/v5/public/spot`
-**Channel:** `orderbook.1.{SYMBOL}` — L1 orderbook (best level only)
-**Limit:** 200 symbols per connection, 10 symbols per subscribe message
-**Ping:** `{"op":"ping"}` every 20s
-**RTT:** available (field `ts` in milliseconds)
+**Канал:** `orderbook.1.{SYMBOL}` — L1 стакан (только лучший уровень)
+**Лимит:** 200 символов на соединение, 10 символов в одном subscribe-сообщении
+**Ping:** `{"op":"ping"}` каждые 20с
+**RTT:** доступен (поле `ts` в миллисекундах)
 
-Subscribe messages sent after connection is established:
+Subscribe-сообщения отправляются после установки соединения:
 ```json
 {"op":"subscribe","args":["orderbook.1.BTCUSDT","orderbook.1.ETHUSDT",...]}
 ```
@@ -233,20 +233,20 @@ Subscribe messages sent after connection is established:
 ### bybit_futures.py
 
 **WebSocket:** `wss://stream.bybit.com/v5/public/linear`
-**Channel:** `orderbook.1.{SYMBOL}`
-Identical to `bybit_spot.py`, differs in URL and batch size (200 instead of 10).
+**Канал:** `orderbook.1.{SYMBOL}`
+Идентичен `bybit_spot.py`, отличается URL и размером батча (200 вместо 10).
 
 ---
 
 ### okx_spot.py
 
 **WebSocket:** `wss://ws.okx.com:8443/ws/v5/public`
-**Channel:** `tickers` with `instId: "BTC-USDT"` (hyphen format)
-**Limit:** 300 symbols per connection
-**Ping:** string `"ping"` every 25s, response `"pong"`
-**RTT:** available (field `ts` — string in ms)
+**Канал:** `tickers` с `instId: "BTC-USDT"` (формат через дефис)
+**Лимит:** 300 символов на соединение
+**Ping:** строка `"ping"` каждые 25с, ответ `"pong"`
+**RTT:** доступен (поле `ts` — строка в мс)
 
-Symbol conversion: `BTCUSDT` → `BTC-USDT` (subscribe) → `BTCUSDT` (Redis key).
+Конвертация символов: `BTCUSDT` → `BTC-USDT` (subscribe) → `BTCUSDT` (ключ Redis).
 
 ```json
 {"op":"subscribe","args":[{"channel":"tickers","instId":"BTC-USDT"},...]}
@@ -257,8 +257,8 @@ Symbol conversion: `BTCUSDT` → `BTC-USDT` (subscribe) → `BTCUSDT` (Redis key
 ### okx_futures.py
 
 **WebSocket:** `wss://ws.okx.com:8443/ws/v5/public`
-**Channel:** `tickers` with `instId: "BTC-USDT-SWAP"`
-Conversion: `BTCUSDT` → `BTC-USDT-SWAP` → `BTCUSDT`.
+**Канал:** `tickers` с `instId: "BTC-USDT-SWAP"`
+Конвертация: `BTCUSDT` → `BTC-USDT-SWAP` → `BTCUSDT`.
 
 ```json
 {"op":"subscribe","args":[{"channel":"tickers","instId":"BTC-USDT-SWAP"},...]}
@@ -269,12 +269,12 @@ Conversion: `BTCUSDT` → `BTC-USDT-SWAP` → `BTCUSDT`.
 ### gate_spot.py
 
 **WebSocket:** `wss://api.gateio.ws/ws/v4/`
-**Channel:** `spot.book_ticker`
-**Limit:** 500 symbols per connection, batches of 100 with 50ms delay between batches
-**Ping:** `{"channel":"spot.ping","time":<unix_ts>}` every 25s
-**RTT:** available (field `result.t` in milliseconds)
+**Канал:** `spot.book_ticker`
+**Лимит:** 500 символов на соединение, батчи по 100 с паузой 50ms между батчами
+**Ping:** `{"channel":"spot.ping","time":<unix_ts>}` каждые 25с
+**RTT:** доступен (поле `result.t` в миллисекундах)
 
-Symbol conversion: `BTCUSDT` → `BTC_USDT` → `BTCUSDT`.
+Конвертация символов: `BTCUSDT` → `BTC_USDT` → `BTCUSDT`.
 
 ```json
 {
@@ -290,34 +290,34 @@ Symbol conversion: `BTCUSDT` → `BTC_USDT` → `BTCUSDT`.
 ### gate_futures.py
 
 **WebSocket:** `wss://fx-ws.gateio.ws/v4/ws/usdt`
-**Channel:** `futures.book_ticker`
-**Ping:** `{"channel":"futures.ping","time":<unix_ts>}` every 25s
-Identical to `gate_spot.py`, differs in URL and channel names.
+**Канал:** `futures.book_ticker`
+**Ping:** `{"channel":"futures.ping","time":<unix_ts>}` каждые 25с
+Идентичен `gate_spot.py`, отличается URL и именами каналов.
 
 ---
 
-## Debugging
+## Отладка
 
-### Run a single script with output to terminal
+### Запустить один скрипт с выводом в терминал
 
 ```bash
 REDIS_HOST=127.0.0.1 python3 market_data/binance_spot.py
 ```
 
-### Force-flush Redis and run a single script
+### Принудительно сбросить Redis и запустить один скрипт
 
 ```bash
 redis-cli --scan --pattern 'md:*' | xargs redis-cli DEL
 python3 market_data/binance_spot.py
 ```
 
-### Check connected WebSocket processes
+### Проверить подключённые WebSocket-процессы
 
 ```bash
 ss -tp | grep python
 ```
 
-### Watch latency in real time (via logs)
+### Смотреть задержки в реальном времени (через логи)
 
 ```bash
 tail -f logs/bybit_spot/$(ls -t logs/bybit_spot/ | head -1)/bybit_spot.log \
