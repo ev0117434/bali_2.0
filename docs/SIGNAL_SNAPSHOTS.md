@@ -2,13 +2,16 @@
 
 ## Назначение
 
-`signal_snapshot_writer.py` записывает снапшоты **только активных сигналов** — пар, у которых спред в данный момент >= `MIN_SPREAD_PCT`. Опрос происходит каждые 0.3 секунды через Redis pipeline.
+`signal_snapshot_writer.py` записывает снапшоты сигналов по следующей логике:
 
-Это позволяет восстановить полную динамику спреда в периоды, когда сигнал был активен: когда он начался, как менялся и когда завершился.
+1. Каждые 0.3 с опрашивает Redis по всем парам из `combination/`.
+2. Когда спред пары **впервые** >= `MIN_SPREAD_PCT` — открывается **окно записи** на `SNAPSHOT_DURATION` секунд (по умолчанию 3500).
+3. В течение окна строки пишутся каждые 0.3 с **независимо** от дальнейшего поведения спреда.
+4. По истечении `SNAPSHOT_DURATION` секунд запись для этой пары **останавливается навсегда** (до следующего запуска скрипта).
 
 Отличие от `signal_scanner.py`:
 - `signal_scanner.py` — записывает **один раз** при первом пересечении порога (cooldown 1 час), результат в `signal/signals.csv`.
-- `signal_snapshot_writer.py` — пишет **каждые 0.3 с пока спред >= порога**, результат в `signal_snapshots/`.
+- `signal_snapshot_writer.py` — пишет **каждые 0.3 с в течение 3500 с** после первого сигнала, результат в `signal_snapshots/`.
 
 ---
 
@@ -79,23 +82,40 @@ dictionaries/combination/
         │  load_directions() — загрузка при старте
         ▼
   pairs: [(spot_exch, fut_exch, symbol), ...]   ← плоский список всех пар
+
+        каждые 0.3 с (SNAPSHOT_WRITE_INTERVAL)
         │
-        │  каждые 0.3 с (SNAPSHOT_WRITE_INTERVAL)
         ▼
   Redis pipeline
   ├── HMGET md:{spot_exch}:spot:{symbol}    → ask, ts
   └── HMGET md:{fut_exch}:futures:{symbol}  → bid, ts
         │
-        │  для каждой пары:
-        │    spread = (bid − ask) / ask × 100
-        │    if spread < MIN_SPREAD_PCT → пропустить (below_threshold)
-        │    if нет данных в Redis → пропустить (skipped)
+        ▼
+  для каждой пары:
+  ┌─ нет данных в Redis → skipped (пропустить)
+  ├─ пара в expired_pairs → пропустить навсегда
+  ├─ пара в active_windows:
+  │    elapsed >= SNAPSHOT_DURATION → window_expired, перенести в expired_pairs
+  │    elapsed  < SNAPSHOT_DURATION → записать строку в CSV
+  └─ пара НЕ в active_windows:
+       spread >= MIN_SPREAD_PCT → window_opened, добавить в active_windows, записать строку
+       spread  < MIN_SPREAD_PCT → below_threshold (пропустить)
+        │
         ▼
   FileHandleManager.get(spot, fut, sym)
   └── signal_snapshots/YYYY-MM-DD/HH/{spot}_s_{fut}_f_{sym}.csv
         │
         ▼
-  fh.write(line)  →  fhm.flush_all() в конце каждого цикла
+  fh.write(line)  →  fhm.flush_all() в конце цикла
+```
+
+### Жизненный цикл окна пары
+
+```
+спред < 1.5%      спред ≥ 1.5%          (3500 с спустя)
+─────────────── ● ──────────────────────── ● ─────────────
+              window_opened             window_expired
+               (начало записи)          (запись навсегда остановлена)
 ```
 
 ### FileHandleManager
@@ -112,14 +132,15 @@ dictionaries/combination/
 
 ## Конфигурация
 
-| Переменная окружения      | По умолчанию | Описание                                  |
-|---------------------------|:------------:|-------------------------------------------|
-| `SNAPSHOT_WRITE_INTERVAL` | `0.3`        | Секунд между циклами записи               |
-| `MIN_SPREAD_PCT`          | `1.5`        | Минимальный спред для записи снапшота, %  |
-| `REDIS_HOST`              | `127.0.0.1`  | Хост Redis                                |
-| `REDIS_PORT`              | `6379`       | Порт Redis                                |
-| `REDIS_DB`                | `0`          | Номер базы данных Redis                   |
-| `REDIS_PASSWORD`          | —            | Пароль Redis (если нужен)                 |
+| Переменная окружения      | По умолчанию | Описание                                        |
+|---------------------------|:------------:|-------------------------------------------------|
+| `SNAPSHOT_WRITE_INTERVAL` | `0.3`        | Секунд между циклами записи                     |
+| `MIN_SPREAD_PCT`          | `1.5`        | Порог спреда для открытия окна записи, %        |
+| `SNAPSHOT_DURATION`       | `3500`       | Длина окна записи после первого сигнала, секунд |
+| `REDIS_HOST`              | `127.0.0.1`  | Хост Redis                                      |
+| `REDIS_PORT`              | `6379`       | Порт Redis                                      |
+| `REDIS_DB`                | `0`          | Номер базы данных Redis                         |
+| `REDIS_PASSWORD`          | —            | Пароль Redis (если нужен)                       |
 
 > `MIN_SPREAD_PCT` должна совпадать с одноимённой переменной в `signal_scanner.py`.
 
@@ -169,13 +190,15 @@ logs/signal_snapshot_writer/
   "config": {
     "write_interval_s": 0.3,
     "min_spread_pct": 1.5,
+    "snapshot_duration_s": 3500,
     "total_pairs": 1440,
     "snapshots_dir": "/path/to/signal_snapshots"
   },
   "cycles": { "total": 33, "window": 33, "rate_per_s": 3.3 },
   "writes": { "total": 12, "window": 12, "rate_per_s": 1.2 },
   "skipped": { "total": 0, "window": 0, "reason": "no_redis_data" },
-  "below_threshold": { "total": 47508, "window": 47508, "threshold": 1.5 },
+  "below_threshold": { "total": 47496, "window": 47496, "threshold": 1.5 },
+  "windows": { "active_now": 4, "activated_total": 4, "expired_total": 0, "duration_s": 3500 },
   "overruns": { "total": 0, "window": 0, "threshold": ">2.0x interval" },
   "errors": { "total": 0, "window": 0, "last": null, "last_ts": null },
   "pipeline_latency_ms": { "min": 1.2, "avg": 2.1, "p95": 3.8, "max": 5.4, "samples": 33 },
@@ -188,12 +211,43 @@ logs/signal_snapshot_writer/
 
 | Поле | Описание |
 |------|----------|
-| `writes` | Строк записано в CSV (только пары со спредом >= порога) |
+| `writes` | Строк записано в CSV |
 | `skipped` | Пар без данных в Redis |
-| `below_threshold` | Пар с активными данными, но спредом ниже порога |
+| `below_threshold` | Пар ниже порога, окно не открыто |
+| `windows.active_now` | Пар с открытым окном прямо сейчас |
+| `windows.activated_total` | Пар, у которых окно когда-либо открывалось |
+| `windows.expired_total` | Пар, у которых окно истекло по таймауту |
 | `pipeline_latency_ms` | Время выполнения Redis pipeline |
 | `write_latency_ms` | Время записи строк + flush файлов |
 | `cycle_latency_ms` | Полное время цикла |
+
+#### `window_opened` — открытие окна записи
+
+```json
+{
+  "type": "window_opened",
+  "ts": "2024-03-19T14:05:32.100Z",
+  "spot_exch": "binance",
+  "fut_exch": "bybit",
+  "symbol": "BTCUSDT",
+  "spread_pct": 1.6234,
+  "duration_s": 3500
+}
+```
+
+#### `window_expired` — истечение окна (запись остановлена)
+
+```json
+{
+  "type": "window_expired",
+  "ts": "2024-03-19T15:03:52.100Z",
+  "spot_exch": "binance",
+  "fut_exch": "bybit",
+  "symbol": "BTCUSDT",
+  "duration_s": 3500.1,
+  "spread_pct": 0.8012
+}
+```
 
 #### `warning` — overrun (цикл > 2× интервала)
 
