@@ -61,6 +61,8 @@ SCRIPTS: List[tuple] = [
     (PROJECT_ROOT / "signal_snapshot_writer.py",  PROJECT_ROOT),
     # Мониторинг Redis
     (MARKET_DIR / "redis_monitor.py",             MARKET_DIR),
+    # Проверка stale тикеров + корзины
+    (MARKET_DIR / "redis_stale_checker.py",       MARKET_DIR),
 ]
 
 
@@ -126,6 +128,10 @@ def clear_signals() -> int:
     signal_dir    = PROJECT_ROOT / "signal"
     snapshots_dir = PROJECT_ROOT / "signal_snapshots"
     return _clear_dir(signal_dir) + _clear_dir(snapshots_dir)
+
+
+def ask_write_baskets() -> bool:
+    return _ask("Записывать списки корзин по stale (stale_baskets/)? [y/N]: ")
 
 
 # ─── Dataclass процесса ───────────────────────────────────────────────────────
@@ -231,9 +237,10 @@ def print_snapshot(procs: List[ProcInfo], manager_start: float) -> None:
     ]
 
     # Сборщики и сканер отдельными секциями
-    collectors = [p for p in procs if p.cwd == MARKET_DIR and p.name != "redis_monitor"]
+    _monitor_names = {"redis_monitor", "redis_stale_checker"}
+    collectors = [p for p in procs if p.cwd == MARKET_DIR and p.name not in _monitor_names]
     scanner    = [p for p in procs if p.cwd == PROJECT_ROOT]
-    monitor    = [p for p in procs if p.name == "redis_monitor"]
+    monitor    = [p for p in procs if p.name in _monitor_names]
 
     for section_name, section in [("СБОРЩИКИ", collectors), ("СКАНЕР", scanner), ("МОНИТОРИНГ", monitor)]:
         lines.append(f"  ── {section_name} " + "─" * (50 - len(section_name)))
@@ -306,9 +313,17 @@ async def main() -> None:
     else:
         print("[run] signal/ и signal_snapshots/ оставлены без изменений.")
 
+    # ── 4. Корзины stale ──────────────────────────────────────────────────────
+    if ask_write_baskets():
+        os.environ["WRITE_BASKETS"] = "1"
+        print("[run] Корзины stale включены → stale_baskets/stale_baskets.json")
+    else:
+        os.environ["WRITE_BASKETS"] = "0"
+        print("[run] Корзины stale отключены.")
+
     print()
 
-    # ── 4. Формируем список процессов ────────────────────────────────────────
+    # ── 5. Формируем список процессов ────────────────────────────────────────
     procs = [
         ProcInfo(name=script.stem, script=script, cwd=cwd)
         for script, cwd in SCRIPTS
