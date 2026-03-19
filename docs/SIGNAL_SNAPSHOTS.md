@@ -2,13 +2,13 @@
 
 ## Назначение
 
-`signal_snapshot_writer.py` непрерывно записывает снапшоты спредов **по всем торговым парам** из `dictionaries/combination/` с интервалом **0.3 секунды**.
+`signal_snapshot_writer.py` записывает снапшоты **только активных сигналов** — пар, у которых спред в данный момент >= `MIN_SPREAD_PCT`. Опрос происходит каждые 0.3 секунды через Redis pipeline.
 
-В отличие от `signal_scanner.py` (который записывает только сигналы выше порога `MIN_SPREAD_PCT`), этот модуль сохраняет историю спреда **для каждой пары** независимо от его значения. Это позволяет:
+Это позволяет восстановить полную динамику спреда в периоды, когда сигнал был активен: когда он начался, как менялся и когда завершился.
 
-- восстановить точную динамику спреда в любой момент времени;
-- найти пары, которые почти достигли порога (потенциальные будущие сигналы);
-- проводить ретроспективный анализ без потери данных.
+Отличие от `signal_scanner.py`:
+- `signal_scanner.py` — записывает **один раз** при первом пересечении порога (cooldown 1 час), результат в `signal/signals.csv`.
+- `signal_snapshot_writer.py` — пишет **каждые 0.3 с пока спред >= порога**, результат в `signal_snapshots/`.
 
 ---
 
@@ -16,33 +16,34 @@
 
 ```
 signal_snapshots/
-└── YYYY-MM-DD/             ← папка дня (UTC)
-    └── HH/                 ← папка часа (UTC, 00–23)
-        ├── binance__bybit__BTCUSDT.csv
-        ├── binance__bybit__ETHUSDT.csv
-        ├── bybit__binance__BTCUSDT.csv
-        └── ...             ← по одному файлу на каждую пару направления
+└── YYYY-MM-DD/                        ← папка дня (UTC)
+    └── HH/                            ← папка часа (UTC, 00–23)
+        ├── binance_s_bybit_f_BTCUSDT.csv
+        ├── binance_s_bybit_f_ETHUSDT.csv
+        ├── bybit_s_binance_f_BTCUSDT.csv
+        └── ...
 ```
 
-**Именование файлов:** `{spot_exch}__{fut_exch}__{symbol}.csv`
+**Именование файлов:** `{spot_exch}_s_{fut_exch}_f_{symbol}.csv`
 
-- `spot_exch` — биржа покупки (спот)
-- `fut_exch`  — биржа продажи (фьючерс)
-- `symbol`    — торговая пара
+- `_s_` — разделитель после спотовой биржи (spot)
+- `_f_` — разделитель после фьючерсной биржи (futures)
 
-**Ротация:** при смене UTC-часа создаётся новая папка `HH/`. Старые папки **не удаляются автоматически** (в отличие от лог-файлов) — управление хранилищем остаётся на усмотрение оператора.
+Примеры: `binance_s_bybit_f_BTCUSDT.csv`, `okx_s_gate_f_ETHUSDT.csv`
+
+**Ротация:** при смене UTC-часа создаётся новая папка `HH/`. Файлы **не удаляются автоматически** — управление хранилищем на усмотрение оператора.
 
 ---
 
 ## Формат CSV
 
-Первая строка файла — заголовок (записывается один раз при создании файла):
+Первая строка файла — заголовок (записывается один раз при создании):
 
 ```
 spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
 ```
 
-Каждая следующая строка — снапшот данного момента:
+Каждая следующая строка — снапшот в момент, когда спред был активен:
 
 ```
 binance,bybit,BTCUSDT,45000.10,45676.35,1.5023,1741234567890
@@ -58,13 +59,14 @@ binance,bybit,BTCUSDT,45000.10,45676.35,1.5023,1741234567890
 | `spread_pct`  | float  | Спред, % = (bid_futures − ask_spot) / ask_spot × 100  |
 | `ts`          | int    | Unix-время в миллисекундах (UTC)                      |
 
-**Пример файла:**
+**Пример файла** `binance_s_bybit_f_BTCUSDT.csv`:
 ```
 spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
 binance,bybit,BTCUSDT,65412.30,65743.10,0.5056,1741234567890
 binance,bybit,BTCUSDT,65415.00,65740.50,0.4965,1741234568190
-binance,bybit,BTCUSDT,65411.80,65741.20,0.5031,1741234568490
 ```
+
+> Строки появляются только пока `spread_pct >= MIN_SPREAD_PCT`. Если спред упал ниже — строки перестают записываться (но файл остаётся открытым для следующего периода активности в том же часе).
 
 ---
 
@@ -84,13 +86,13 @@ dictionaries/combination/
   ├── HMGET md:{spot_exch}:spot:{symbol}    → ask, ts
   └── HMGET md:{fut_exch}:futures:{symbol}  → bid, ts
         │
-        │  для каждой пары с валидными данными
-        ▼
-  spread_pct = (bid − ask) / ask × 100
-        │
+        │  для каждой пары:
+        │    spread = (bid − ask) / ask × 100
+        │    if spread < MIN_SPREAD_PCT → пропустить (below_threshold)
+        │    if нет данных в Redis → пропустить (skipped)
         ▼
   FileHandleManager.get(spot, fut, sym)
-  └── signal_snapshots/YYYY-MM-DD/HH/{spot}__{fut}__{sym}.csv
+  └── signal_snapshots/YYYY-MM-DD/HH/{spot}_s_{fut}_f_{sym}.csv
         │
         ▼
   fh.write(line)  →  fhm.flush_all() в конце каждого цикла
@@ -102,45 +104,46 @@ dictionaries/combination/
 
 1. Сбрасывает (`flush`) и закрывает все открытые дескрипторы.
 2. Обновляет текущий ключ часа.
-3. Новые дескрипторы открываются лениво при первом обращении `get()`.
+3. Новые дескрипторы открываются лениво при первом `get()`.
 
-Ротация проверяется **один раз в начале каждого цикла** (`check_rotate()`), а не внутри `get()`, чтобы все пары одного цикла гарантированно записывались в одну и ту же папку часа.
+Ротация проверяется **один раз в начале каждого цикла** (`check_rotate()`), чтобы все пары одного цикла гарантированно писались в одну папку часа.
 
 ---
 
 ## Конфигурация
 
-| Переменная окружения      | По умолчанию | Описание                              |
-|---------------------------|:------------:|---------------------------------------|
-| `SNAPSHOT_WRITE_INTERVAL` | `0.3`        | Секунд между циклами записи           |
-| `REDIS_HOST`              | `127.0.0.1`  | Хост Redis                            |
-| `REDIS_PORT`              | `6379`       | Порт Redis                            |
-| `REDIS_DB`                | `0`          | Номер базы данных Redis               |
-| `REDIS_PASSWORD`          | —            | Пароль Redis (если нужен)             |
+| Переменная окружения      | По умолчанию | Описание                                  |
+|---------------------------|:------------:|-------------------------------------------|
+| `SNAPSHOT_WRITE_INTERVAL` | `0.3`        | Секунд между циклами записи               |
+| `MIN_SPREAD_PCT`          | `1.5`        | Минимальный спред для записи снапшота, %  |
+| `REDIS_HOST`              | `127.0.0.1`  | Хост Redis                                |
+| `REDIS_PORT`              | `6379`       | Порт Redis                                |
+| `REDIS_DB`                | `0`          | Номер базы данных Redis                   |
+| `REDIS_PASSWORD`          | —            | Пароль Redis (если нужен)                 |
+
+> `MIN_SPREAD_PCT` должна совпадать с одноимённой переменной в `signal_scanner.py`.
 
 ---
 
 ## Логирование
 
-Логи хранятся в `logs/signal_snapshot_writer/` в формате **JSON Lines** (один JSON-объект на строку).
+Логи в `logs/signal_snapshot_writer/` в формате **JSON Lines**.
 
 ### Ротация логов
 
-- Один чанк = **24 часа**.
-- Хранится не более **2 завершённых чанков** (≈ 48 часов).
-- При открытии нового чанка самый старый удаляется автоматически.
+- Один чанк = **24 часа**, хранится **2 завершённых чанка** (≈ 48 ч).
 
 ```
 logs/signal_snapshot_writer/
-├── 20240318_120000-20240319_120000/   ← завершённый
+├── 20240318_120000-20240319_120000/
 │   └── signal_snapshot_writer.log
-└── 20240319_120000-ongoing/           ← текущий
+└── 20240319_120000-ongoing/
     └── signal_snapshot_writer.log
 ```
 
 ### Типы записей
 
-#### `start` — запуск скрипта
+#### `start` — запуск
 
 ```json
 {
@@ -149,34 +152,14 @@ logs/signal_snapshot_writer/
   "config": {
     "redis": "127.0.0.1:6379/0",
     "write_interval_s": 0.3,
+    "min_spread_pct": 1.5,
     "snapshots_dir": "/path/to/signal_snapshots",
     "combination_dir": "/path/to/dictionaries/combination"
   }
 }
 ```
 
-#### `directions_loaded` — пары загружены
-
-```json
-{
-  "type": "directions_loaded",
-  "ts": "2024-03-19T12:00:00.050Z",
-  "directions": 12,
-  "pairs": 1440
-}
-```
-
-#### `redis_connected` — подключение к Redis
-
-```json
-{
-  "type": "redis_connected",
-  "ts": "2024-03-19T12:00:00.080Z",
-  "redis": "127.0.0.1:6379/0"
-}
-```
-
-#### `snapshot` — периодический снапшот (каждые 10 с)
+#### `snapshot` — каждые 10 с
 
 ```json
 {
@@ -185,74 +168,34 @@ logs/signal_snapshot_writer/
   "uptime_s": 10.0,
   "config": {
     "write_interval_s": 0.3,
+    "min_spread_pct": 1.5,
     "total_pairs": 1440,
     "snapshots_dir": "/path/to/signal_snapshots"
   },
-  "cycles": {
-    "total": 33,
-    "window": 33,
-    "rate_per_s": 3.3
-  },
-  "writes": {
-    "total": 47520,
-    "window": 47520,
-    "rate_per_s": 4752.0
-  },
-  "skipped": {
-    "total": 0,
-    "window": 0,
-    "reason": "no_redis_data"
-  },
-  "overruns": {
-    "total": 0,
-    "window": 0,
-    "threshold": ">2.0x interval"
-  },
-  "errors": {
-    "total": 0,
-    "window": 0,
-    "last": null,
-    "last_ts": null
-  },
-  "pipeline_latency_ms": {
-    "min": 1.2,
-    "avg": 2.1,
-    "p95": 3.8,
-    "max": 5.4,
-    "samples": 33
-  },
-  "write_latency_ms": {
-    "min": 0.8,
-    "avg": 1.5,
-    "p95": 2.9,
-    "max": 4.1,
-    "samples": 33
-  },
-  "cycle_latency_ms": {
-    "min": 2.1,
-    "avg": 3.8,
-    "p95": 6.2,
-    "max": 9.0,
-    "samples": 33
-  }
+  "cycles": { "total": 33, "window": 33, "rate_per_s": 3.3 },
+  "writes": { "total": 12, "window": 12, "rate_per_s": 1.2 },
+  "skipped": { "total": 0, "window": 0, "reason": "no_redis_data" },
+  "below_threshold": { "total": 47508, "window": 47508, "threshold": 1.5 },
+  "overruns": { "total": 0, "window": 0, "threshold": ">2.0x interval" },
+  "errors": { "total": 0, "window": 0, "last": null, "last_ts": null },
+  "pipeline_latency_ms": { "min": 1.2, "avg": 2.1, "p95": 3.8, "max": 5.4, "samples": 33 },
+  "write_latency_ms":    { "min": 0.01, "avg": 0.05, "p95": 0.1, "max": 0.3, "samples": 33 },
+  "cycle_latency_ms":    { "min": 2.1, "avg": 3.8, "p95": 6.2, "max": 9.0, "samples": 33 }
 }
 ```
 
-**Поля снапшота:**
+**Ключевые поля:**
 
 | Поле | Описание |
 |------|----------|
-| `cycles` | Счётчик полных итераций основного цикла |
-| `writes` | Строк, записанных в CSV-файлы |
-| `skipped` | Пар, пропущенных из-за отсутствия данных в Redis |
-| `overruns` | Циклов, превысивших `2 × WRITE_INTERVAL` по времени |
-| `pipeline_latency_ms` | Время выполнения Redis pipeline (мс) |
-| `write_latency_ms` | Время записи и flush всех файлов (мс) |
-| `cycle_latency_ms` | Полное время цикла (pipeline + write + overhead) |
+| `writes` | Строк записано в CSV (только пары со спредом >= порога) |
+| `skipped` | Пар без данных в Redis |
+| `below_threshold` | Пар с активными данными, но спредом ниже порога |
+| `pipeline_latency_ms` | Время выполнения Redis pipeline |
+| `write_latency_ms` | Время записи строк + flush файлов |
+| `cycle_latency_ms` | Полное время цикла |
 
-#### `warning` — превышение целевого интервала
-
-Записывается, если цикл занял более `2 × WRITE_INTERVAL` секунд:
+#### `warning` — overrun (цикл > 2× интервала)
 
 ```json
 {
@@ -262,64 +205,25 @@ logs/signal_snapshot_writer/
   "cycle_ms": 812.4,
   "target_ms": 300.0,
   "pipeline_ms": 750.1,
-  "write_ms": 55.3,
-  "written": 1438,
-  "skipped": 2
+  "write_ms": 0.3,
+  "written": 4,
+  "skipped": 0,
+  "below_threshold": 1436
 }
 ```
 
-#### `error` — ошибка Redis или записи в файл
+#### `error` — ошибка
 
 ```json
-{
-  "type": "error",
-  "ts": "2024-03-19T12:01:00.000Z",
-  "phase": "redis_pipeline",
-  "error": "ConnectionError: ..."
-}
+{ "type": "error", "ts": "...", "phase": "redis_pipeline", "error": "ConnectionError: ..." }
+{ "type": "error", "ts": "...", "phase": "file_write", "pair": "binance_s_bybit_f_BTCUSDT", "error": "OSError: ..." }
 ```
+
+#### `stop` — остановка
 
 ```json
-{
-  "type": "error",
-  "ts": "2024-03-19T12:01:00.100Z",
-  "phase": "file_write",
-  "pair": "binance__bybit__BTCUSDT",
-  "error": "OSError: [Errno 28] No space left on device"
-}
+{ "type": "stop", "ts": "...", "cycles_total": 216000, "writes_total": 840, "errors_total": 0 }
 ```
-
-Поле `phase`:
-- `redis_pipeline` — ошибка при выполнении `pipe.execute()`
-- `file_write` — ошибка при записи в конкретный CSV-файл
-
-#### `stop` — остановка скрипта
-
-```json
-{
-  "type": "stop",
-  "ts": "2024-03-19T18:00:00.000Z",
-  "cycles_total": 216000,
-  "writes_total": 311040000,
-  "errors_total": 0
-}
-```
-
----
-
-## Производительность
-
-| Параметр | Значение |
-|----------|----------|
-| Интервал цикла | 0.3 с (≈ 3.3 цикла/с) |
-| Redis pipeline | 1 pipeline на цикл, 2 команды на пару |
-| Ожидаемая задержка pipeline | 1–5 мс |
-| Записей в секунду | ≈ `total_pairs × 3.3` |
-| Размер одной строки | ≈ 60–80 байт |
-| Дисковая нагрузка при 1000 парах | ≈ 200–250 КБ/с |
-| Объём за 1 час при 1000 парах | ≈ 720–900 МБ/ч |
-
-> **Совет:** при большом количестве пар рекомендуется мониторить переменную `overruns` в снапшотах. Если цикл систематически занимает более 0.6 с (2 × интервал), увеличьте `SNAPSHOT_WRITE_INTERVAL` или убедитесь в производительности Redis и диска.
 
 ---
 
@@ -329,53 +233,46 @@ logs/signal_snapshot_writer/
 # Следить за логами в реальном времени
 tail -f logs/signal_snapshot_writer/$(ls -t logs/signal_snapshot_writer/ | head -1)/signal_snapshot_writer.log
 
-# Посмотреть последние снапшоты (только type=snapshot)
+# Только снапшоты (type=snapshot)
 grep '"type": "snapshot"' \
   logs/signal_snapshot_writer/$(ls -t logs/signal_snapshot_writer/ | head -1)/signal_snapshot_writer.log \
-  | tail -3 | python3 -m json.tool
+  | tail -1 | python3 -m json.tool
 
-# Посмотреть ошибки
+# Только ошибки
 grep '"type": "error"' \
   logs/signal_snapshot_writer/$(ls -t logs/signal_snapshot_writer/ | head -1)/signal_snapshot_writer.log
 
-# Количество строк в файле пары за текущий час
-wc -l signal_snapshots/$(date -u +%Y-%m-%d)/$(date -u +%H)/binance__bybit__BTCUSDT.csv
+# Последние строки снапшота для пары (текущий час)
+tail -10 signal_snapshots/$(date -u +%Y-%m-%d)/$(date -u +%H)/binance_s_bybit_f_BTCUSDT.csv
 
-# Последние 5 снапшотов пары
-tail -5 signal_snapshots/$(date -u +%Y-%m-%d)/$(date -u +%H)/binance__bybit__BTCUSDT.csv
+# Список файлов в текущем часе
+ls signal_snapshots/$(date -u +%Y-%m-%d)/$(date -u +%H)/
 
-# Общее количество файлов за сегодня
-find signal_snapshots/$(date -u +%Y-%m-%d)/ -name "*.csv" | wc -l
-
-# Общий объём данных за сегодня
+# Общий объём за сегодня
 du -sh signal_snapshots/$(date -u +%Y-%m-%d)/
 ```
 
 ---
 
-## Запуск отдельно (отладка)
+## Запуск отдельно
 
 ```bash
-# Запустить только signal_snapshot_writer
 python3 signal_snapshot_writer.py
 
-# С нестандартным интервалом
-SNAPSHOT_WRITE_INTERVAL=1.0 python3 signal_snapshot_writer.py
+# С другим порогом
+MIN_SPREAD_PCT=2.0 python3 signal_snapshot_writer.py
 
-# С внешним Redis
-REDIS_HOST=10.0.0.5 REDIS_PASSWORD=secret python3 signal_snapshot_writer.py
+# С нестандартным интервалом
+SNAPSHOT_WRITE_INTERVAL=0.5 MIN_SPREAD_PCT=1.5 python3 signal_snapshot_writer.py
 ```
 
 ---
 
 ## Управление хранилищем
 
-Файлы снапшотов **не удаляются автоматически**. Рекомендуемые подходы:
+Файлы снапшотов не удаляются автоматически:
 
 ```bash
 # Удалить данные старше 7 дней
-find signal_snapshots/ -type d -name "????-??-??" -mtime +7 -exec rm -rf {} +
-
-# Удалить все данные кроме последних 2 дней (пример cron)
-# 0 3 * * * find /path/to/signal_snapshots/ -maxdepth 1 -type d -mtime +2 -exec rm -rf {} +
+find signal_snapshots/ -maxdepth 1 -type d -name "????-??-??" -mtime +7 -exec rm -rf {} +
 ```
