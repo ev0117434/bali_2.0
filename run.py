@@ -56,9 +56,11 @@ SCRIPTS: List[tuple] = [
     (MARKET_DIR / "gate_spot.py",       MARKET_DIR),
     (MARKET_DIR / "gate_futures.py",    MARKET_DIR),
     # Сканер сигналов
-    (PROJECT_ROOT / "signal_scanner.py", PROJECT_ROOT),
+    (PROJECT_ROOT / "signal_scanner.py",          PROJECT_ROOT),
+    # Запись снапшотов спредов (каждые 0.3с, папки по дням/часам)
+    (PROJECT_ROOT / "signal_snapshot_writer.py",  PROJECT_ROOT),
     # Мониторинг Redis
-    (MARKET_DIR / "redis_monitor.py",    MARKET_DIR),
+    (MARKET_DIR / "redis_monitor.py",             MARKET_DIR),
 ]
 
 
@@ -86,25 +88,44 @@ async def flush_redis() -> int:
         await client.aclose()
 
 
-def ask_clear_logs() -> bool:
+def _ask(prompt: str) -> bool:
     try:
-        ans = input("Очистить папку logs/? [y/N]: ").strip().lower()
+        ans = input(prompt).strip().lower()
         return ans in ("y", "yes", "д", "да")
     except (EOFError, KeyboardInterrupt):
         return False
 
 
-def clear_logs() -> int:
-    if not LOGS_DIR.exists():
+def _clear_dir(path: Path) -> int:
+    """Удаляет содержимое папки. Возвращает количество удалённых объектов."""
+    if not path.exists():
         return 0
     count = 0
-    for item in LOGS_DIR.iterdir():
+    for item in path.iterdir():
         if item.is_dir():
             shutil.rmtree(item)
         else:
             item.unlink()
         count += 1
     return count
+
+
+def ask_clear_logs() -> bool:
+    return _ask("Очистить папку logs/? [y/N]: ")
+
+
+def clear_logs() -> int:
+    return _clear_dir(LOGS_DIR)
+
+
+def ask_clear_signals() -> bool:
+    return _ask("Очистить папки signal/ и signal_snapshots/? [y/N]: ")
+
+
+def clear_signals() -> int:
+    signal_dir    = PROJECT_ROOT / "signal"
+    snapshots_dir = PROJECT_ROOT / "signal_snapshots"
+    return _clear_dir(signal_dir) + _clear_dir(snapshots_dir)
 
 
 # ─── Dataclass процесса ───────────────────────────────────────────────────────
@@ -278,9 +299,16 @@ async def main() -> None:
     else:
         print("[run] Логи оставлены без изменений.")
 
+    # ── 3. Очистка сигналов и снапшотов ──────────────────────────────────────
+    if ask_clear_signals():
+        n = clear_signals()
+        print(f"[run] signal/ и signal_snapshots/ очищены ({n} объектов удалено).")
+    else:
+        print("[run] signal/ и signal_snapshots/ оставлены без изменений.")
+
     print()
 
-    # ── 3. Формируем список процессов ────────────────────────────────────────
+    # ── 4. Формируем список процессов ────────────────────────────────────────
     procs = [
         ProcInfo(name=script.stem, script=script, cwd=cwd)
         for script, cwd in SCRIPTS

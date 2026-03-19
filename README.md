@@ -31,7 +31,7 @@ dictionaries/combination/     ← 12 файлов пересечений (spot_A
         │
         │  коллекторы читают subscribe/ при старте
         ▼
-run.py  ←  запускает 10 процессов
+run.py  ←  запускает 11 процессов
   ├── binance_spot.py    ─┐
   ├── binance_futures.py  │
   ├── bybit_spot.py       │  WebSocket → Redis
@@ -41,9 +41,11 @@ run.py  ←  запускает 10 процессов
   ├── gate_spot.py        │
   ├── gate_futures.py    ─┘
   │
-  ├── signal_scanner.py      Redis → signal/signals.csv
-  │                          (спред ≥ 1.5% → сигнал)
-  └── redis_monitor.py       Redis метрики → logs/redis_monitor/
+  ├── signal_scanner.py          Redis → signal/signals.csv
+  │                              (спред ≥ 1.5% → сигнал)
+  ├── signal_snapshot_writer.py  Redis → signal_snapshots/YYYY-MM-DD/HH/*.csv
+  │                              (все пары каждые 0.3 с)
+  └── redis_monitor.py           Redis метрики → logs/redis_monitor/
 ```
 
 **Формула арбитражного спреда:**
@@ -72,13 +74,28 @@ spread = (bid_futures - ask_spot) / ask_spot × 100%
 
 Каждые 0.2с читает тикеры из Redis по всем парам из `combination/`, вычисляет спред и при превышении порога записывает строку в `signal/signals.csv`.
 
-### 4. `redis_monitor.py` — Мониторинг Redis
+### 4. `signal_snapshot_writer.py` — Запись снапшотов спредов
+
+Каждые 0.3с читает тикеры из Redis **по всем парам** (независимо от порога), вычисляет спред и записывает строку в CSV-файл. Файлы организованы по дням и часам:
+
+```
+signal_snapshots/
+└── YYYY-MM-DD/
+    └── HH/
+        ├── binance__bybit__BTCUSDT.csv
+        ├── binance__bybit__ETHUSDT.csv
+        └── ...
+```
+
+Подробнее: [`docs/SIGNAL_SNAPSHOTS.md`](docs/SIGNAL_SNAPSHOTS.md)
+
+### 5. `redis_monitor.py` — Мониторинг Redis
 
 Каждые 5с собирает метрики Redis (латентность, память, ops/sec, keyspace) и пишет в `logs/redis_monitor/`.
 
-### 5. `run.py` — Главный запускатор
+### 7. `run.py` — Главный запускатор
 
-Запускает все 10 процессов, следит за ними, перезапускает упавшие с экспоненциальной задержкой. Снапшот состояния — каждые 10 секунд.
+Запускает все 11 процессов, следит за ними, перезапускает упавшие с экспоненциальной задержкой. Снапшот состояния — каждые 10 секунд.
 
 ---
 
@@ -148,6 +165,12 @@ python3 run.py
 | `SIGNAL_COOLDOWN` | `3600`       | Секунд между повторными сигналами (по паре)   |
 | `MIN_SPREAD_PCT`  | `1.5`        | Минимальный спред для генерации сигнала, %    |
 
+### signal_snapshot_writer.py
+
+| Переменная                | По умолчанию | Описание                                     |
+|---------------------------|:------------:|----------------------------------------------|
+| `SNAPSHOT_WRITE_INTERVAL` | `0.3`        | Секунд между записями снапшотов              |
+
 ### redis_monitor.py
 
 | Переменная         | По умолчанию          | Описание                        |
@@ -171,11 +194,20 @@ REDIS_HOST=10.0.0.5 REDIS_PASSWORD=secret MIN_SPREAD_PCT=2.0 python3 run.py
 ```
 bali_2.0/
 │
-├── run.py                          # Главный запускатор (10 процессов)
+├── run.py                          # Главный запускатор (11 процессов)
 ├── signal_scanner.py               # Сканер арбитражных сигналов
+├── signal_snapshot_writer.py       # Запись снапшотов спредов (каждые 0.3 с)
 │
 ├── signal/
-│   └── signals.csv                 # Обнаруженные сигналы (CSV)
+│   └── signals.csv                 # Обнаруженные сигналы (CSV, спред ≥ порога)
+│
+├── signal_snapshots/               # Снапшоты всех пар (создаётся при запуске)
+│   └── YYYY-MM-DD/                 # папка дня (UTC)
+│       └── HH/                     # папка часа (UTC, 00–23)
+│           └── {spot}__{fut}__{symbol}.csv  # файл пары
+│
+├── docs/
+│   └── SIGNAL_SNAPSHOTS.md         # Документация signal_snapshot_writer
 │
 ├── dictionaries/                   # Генерация списков торговых пар
 │   ├── main.py                     # Запускатор (REST + WS-валидация)
@@ -220,6 +252,7 @@ bali_2.0/
     ├── okx_spot/    okx_futures/
     ├── gate_spot/   gate_futures/
     ├── signal_scanner/
+    ├── signal_snapshot_writer/
     └── redis_monitor/
 ```
 
@@ -278,6 +311,9 @@ tail -f logs/binance_spot/$(ls -t logs/binance_spot/ | head -1)/binance_spot.log
 # Сканер сигналов
 tail -f logs/signal_scanner/$(ls -t logs/signal_scanner/ | head -1)/signal_scanner.log
 
+# Записчик снапшотов
+tail -f logs/signal_snapshot_writer/$(ls -t logs/signal_snapshot_writer/ | head -1)/signal_snapshot_writer.log
+
 # Redis монитор
 tail -f logs/redis_monitor/$(ls -t logs/redis_monitor/ | head -1)/monitor.log
 ```
@@ -302,11 +338,24 @@ watch -n 1 'redis-cli HGET md:bybit:spot:BTCUSDT ts'
 ### Сигналы
 
 ```bash
-# Последние 10 сигналов
+# Последние 10 сигналов (порог MIN_SPREAD_PCT)
 tail -10 signal/signals.csv
 
 # Количество сигналов за сегодня
 grep $(date +%Y) signal/signals.csv | wc -l
+```
+
+### Снапшоты спредов
+
+```bash
+# Посмотреть последние записи для конкретной пары (текущий час)
+tail -20 signal_snapshots/$(date -u +%Y-%m-%d)/$(date -u +%H)/binance__bybit__BTCUSDT.csv
+
+# Сколько строк записано за текущий час по всем парам
+wc -l signal_snapshots/$(date -u +%Y-%m-%d)/$(date -u +%H)/*.csv | tail -1
+
+# Список папок (дней)
+ls signal_snapshots/
 ```
 
 ### Состояние процессов

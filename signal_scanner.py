@@ -427,24 +427,20 @@ async def scan_loop(
         now   = time.time()
         ts_ms = int(now * 1000)
 
-        # ── Строим pipeline для пар без активного cooldown ────────────────────
+        # ── Строим pipeline для всех пар ─────────────────────────────────────
+        # Cooldown больше не исключает пары из pipeline — он только блокирует
+        # запись в signals.csv. Это нужно чтобы signals:active обновлялся
+        # непрерывно и signal_snapshot_writer видел все активные сигналы.
         pipe     = redis_client.pipeline(transaction=False)
-        requests: List[Tuple[str, str, str, str]] = []   # (spot, fut, sym, ckey)
-        skipped  = 0
+        requests: List[Tuple[str, str, str, str, bool]] = []  # (spot, fut, sym, ckey, in_cooldown)
 
         for spot_exch, fut_exch, symbols in directions:
             for sym in symbols:
-                ckey = f"{spot_exch}:{fut_exch}:{sym}"
-                if now - cooldown.get(ckey, 0.0) < SIGNAL_COOLDOWN:
-                    skipped += 1
-                    continue
-                # hmget возвращает [ask, ts] и [bid, ts]
-                pipe.hmget(f"md:{spot_exch}:spot:{sym}",    "ask", "ts")
-                pipe.hmget(f"md:{fut_exch}:futures:{sym}",  "bid", "ts")
-                requests.append((spot_exch, fut_exch, sym, ckey))
-
-        if skipped:
-            stats.record_cooldown_skip(skipped)
+                ckey        = f"{spot_exch}:{fut_exch}:{sym}"
+                in_cooldown = (now - cooldown.get(ckey, 0.0)) < SIGNAL_COOLDOWN
+                pipe.hmget(f"md:{spot_exch}:spot:{sym}",   "ask", "ts")
+                pipe.hmget(f"md:{fut_exch}:futures:{sym}", "bid", "ts")
+                requests.append((spot_exch, fut_exch, sym, ckey, in_cooldown))
 
         if not requests:
             continue
@@ -462,7 +458,12 @@ async def scan_loop(
         stats.record_scan(pipeline_ms)
 
         # ── Обрабатываем результаты ───────────────────────────────────────────
-        for i, (spot_exch, fut_exch, sym, ckey) in enumerate(requests):
+        # notify_pipe — пакетная запись активных сигналов для snapshot_writer
+        notify_pipe      = redis_client.pipeline(transaction=False)
+        has_notify       = False
+        cooldown_skipped = 0
+
+        for i, (spot_exch, fut_exch, sym, ckey, in_cooldown) in enumerate(requests):
             spot_row = results[i * 2]      # [ask, ts]
             fut_row  = results[i * 2 + 1]  # [bid, ts]
 
@@ -491,13 +492,24 @@ async def scan_loop(
 
             stats.record_data_age(age_ms)
 
-            # Спот всегда дешевле фьючерса
             spread_pct = (bid_futures - ask_spot) / ask_spot * 100
 
             if spread_pct < MIN_SPREAD_PCT:
                 continue
 
-            # ── Сигнал ───────────────────────────────────────────────────────
+            # ── Спред достиг порога ───────────────────────────────────────────
+
+            # 1. Уведомляем signal_snapshot_writer через Redis hash.
+            #    Пишем timestamp последнего обнаружения — snapshot_writer
+            #    использует его чтобы определить, когда сигнал стал активным.
+            notify_pipe.hset("signals:active", ckey, str(now))
+            has_notify = True
+
+            # 2. Запись в signals.csv — только если cooldown не активен
+            if in_cooldown:
+                cooldown_skipped += 1
+                continue
+
             cooldown[ckey] = now
 
             signal_obj = {
@@ -528,6 +540,19 @@ async def scan_loop(
                 f"age={age_ms:.0f}ms",
                 flush=True,
             )
+
+        if cooldown_skipped:
+            stats.record_cooldown_skip(cooldown_skipped)
+
+        # ── Отправляем уведомления signal_snapshot_writer ────────────────────
+        if has_notify:
+            try:
+                await notify_pipe.execute()
+            except Exception as exc:
+                err = repr(exc)[:200]
+                stats.record_error(err)
+                log.write({"type": "error", "ts": _now_iso(),
+                           "phase": "notify_signals_active", "error": err})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
