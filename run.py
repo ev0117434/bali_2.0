@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run.py — Запуск всей системы: 8 сборщиков рыночных данных + signal_scanner.
+run.py — Запуск всей системы: 8 сборщиков рыночных данных + signal_scanner + redis_monitor.
 
 Запускает каждый скрипт как отдельный subprocess, следит за ними
 и автоматически перезапускает упавшие процессы с экспоненциальной задержкой.
@@ -57,6 +57,8 @@ SCRIPTS: List[tuple] = [
     (MARKET_DIR / "gate_futures.py",    MARKET_DIR),
     # Сканер сигналов
     (PROJECT_ROOT / "signal_scanner.py", PROJECT_ROOT),
+    # Мониторинг Redis
+    (MARKET_DIR / "redis_monitor.py",    MARKET_DIR),
 ]
 
 
@@ -208,10 +210,11 @@ def print_snapshot(procs: List[ProcInfo], manager_start: float) -> None:
     ]
 
     # Сборщики и сканер отдельными секциями
-    collectors = [p for p in procs if p.cwd == MARKET_DIR]
+    collectors = [p for p in procs if p.cwd == MARKET_DIR and p.name != "redis_monitor"]
     scanner    = [p for p in procs if p.cwd == PROJECT_ROOT]
+    monitor    = [p for p in procs if p.name == "redis_monitor"]
 
-    for section_name, section in [("СБОРЩИКИ", collectors), ("СКАНЕР", scanner)]:
+    for section_name, section in [("СБОРЩИКИ", collectors), ("СКАНЕР", scanner), ("МОНИТОРИНГ", monitor)]:
         lines.append(f"  ── {section_name} " + "─" * (50 - len(section_name)))
         for p in section:
             if p.status == "running":
