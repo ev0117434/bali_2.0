@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-signal_snapshot_writer.py — Запись снапшотов активных сигналов каждые 0.3 секунды.
+signal_snapshot_writer.py — Запись снапшотов сигналов каждые 0.3 секунды.
 
-Каждые SNAPSHOT_WRITE_INTERVAL секунд опрашивает Redis по всем парам из
-dictionaries/combination/. Когда спред пары впервые >= MIN_SPREAD_PCT —
-запускается окно записи длиной SNAPSHOT_DURATION секунд. В течение этого
-окна строки пишутся каждые 0.3 с независимо от дальнейшего поведения спреда.
-По истечении окна запись для этой пары останавливается навсегда (до рестарта).
+Работает в паре с signal_scanner.py. Когда signal_scanner обнаруживает
+сигнал (спред >= MIN_SPREAD_PCT), он записывает пару в Redis hash "signals:active".
+Этот скрипт читает "signals:active" каждые 0.3 с и для новых пар открывает
+окно записи длиной SNAPSHOT_DURATION секунд. По истечении окна запись
+останавливается навсегда (до рестарта скрипта).
+
+Разделение ответственности:
+    signal_scanner.py       — находит сигналы, пишет в signals:active + signals.csv
+    signal_snapshot_writer  — читает signals:active, пишет CSV-снапшоты
+
+Redis-ключ уведомления:
+    HSET signals:active {spot}:{fut}:{symbol} {timestamp}
+    (обновляется signal_scanner каждые 0.2 с пока спред активен)
 
 Структура выходных файлов:
     signal_snapshots/
     └── YYYY-MM-DD/                        ← папка дня (UTC)
         └── HH/                            ← папка часа (UTC, 00–23)
-            └── {spot}_s_{fut}_f_{sym}.csv ← файл пары (только активные сигналы)
+            └── {spot}_s_{fut}_f_{sym}.csv ← файл пары
 
 Пример имени файла:
     binance_s_bybit_f_BTCUSDT.csv
 
-Формат строки CSV (первая строка файла — заголовок):
+Формат CSV (первая строка — заголовок):
     spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
     binance,bybit,BTCUSDT,45000.10,45676.35,1.5023,1741234567890
 
 Логи (JSON Lines) — logs/signal_snapshot_writer/:
-    type: "start"     — запуск скрипта
-    type: "snapshot"  — каждые 10 с: метрики производительности и задержек
-    type: "warning"   — превышение целевого интервала цикла (overrun)
-    type: "error"     — ошибка Redis pipeline или записи в файл
-    type: "stop"      — остановка скрипта
+    type: "start"          — запуск скрипта
+    type: "snapshot"       — каждые 10 с: метрики
+    type: "window_opened"  — открытие окна записи для пары
+    type: "window_expired" — истечение 3500 с, запись остановлена
+    type: "warning"        — превышение интервала цикла (overrun)
+    type: "error"          — ошибка Redis или записи в файл
+    type: "stop"           — остановка скрипта
 
 Переменные окружения:
     REDIS_HOST               (default: 127.0.0.1)
@@ -35,8 +45,7 @@ dictionaries/combination/. Когда спред пары впервые >= MIN_
     REDIS_DB                 (default: 0)
     REDIS_PASSWORD           (default: пусто)
     SNAPSHOT_WRITE_INTERVAL  (default: 0.3)    — секунд между записями
-    MIN_SPREAD_PCT           (default: 1.5)    — минимальный спред для запуска окна, %
-    SNAPSHOT_DURATION        (default: 3500)   — секунд записи после первого сигнала
+    SNAPSHOT_DURATION        (default: 3500)   — длина окна записи, секунд
 
 Использование:
     python3 signal_snapshot_writer.py
@@ -55,9 +64,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import redis.asyncio as aioredis
 
 # ─── Пути ────────────────────────────────────────────────────────────────────
-PROJECT_ROOT    = Path(__file__).resolve().parent
-COMBINATION_DIR = PROJECT_ROOT / "dictionaries" / "combination"
-SNAPSHOTS_DIR   = PROJECT_ROOT / "signal_snapshots"
+PROJECT_ROOT  = Path(__file__).resolve().parent
+SNAPSHOTS_DIR = PROJECT_ROOT / "signal_snapshots"
 LOGS_DIR        = PROJECT_ROOT / "logs"
 
 # ─── Redis ────────────────────────────────────────────────────────────────────
@@ -67,9 +75,13 @@ REDIS_DB       = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
-WRITE_INTERVAL     = float(os.getenv("SNAPSHOT_WRITE_INTERVAL", "0.3"))  # секунд
-MIN_SPREAD_PCT     = float(os.getenv("MIN_SPREAD_PCT", "1.5"))            # %
-SNAPSHOT_DURATION  = float(os.getenv("SNAPSHOT_DURATION", "3500"))        # секунд
+WRITE_INTERVAL    = float(os.getenv("SNAPSHOT_WRITE_INTERVAL", "0.3"))  # секунд
+SNAPSHOT_DURATION = float(os.getenv("SNAPSHOT_DURATION", "3500"))        # секунд
+
+# Ключ Redis, в который signal_scanner пишет активные сигналы
+SIGNALS_ACTIVE_KEY = "signals:active"
+# Пара считается "свежей" если signal_scanner обновил её не более чем SIGNAL_FRESHNESS секунд назад
+SIGNAL_FRESHNESS   = 2.0   # > SCAN_INTERVAL (0.2), учитывает задержку сети/Redis
 LOG_SNAPSHOT_EVERY = 10    # секунд между JSON-снапшотами в лог
 OVERRUN_THRESHOLD  = 2.0   # лог warning если цикл занял > WRITE_INTERVAL * это число
 SCRIPT_NAME        = "signal_snapshot_writer"
@@ -256,11 +268,8 @@ class Stats:
         self.writes_total   = 0   # строк записано
         self.writes_window  = 0
 
-        self.skipped_total  = 0   # пар пропущено (нет данных в Redis)
+        self.skipped_total  = 0   # пар пропущено (нет данных в Redis для окна)
         self.skipped_window = 0
-
-        self.below_total    = 0   # пар пропущено (спред ниже порога, окно не открыто)
-        self.below_window   = 0
 
         self.activated_total = 0  # пар, у которых открылось окно записи
         self.expired_total   = 0  # пар, у которых окно закрылось по таймауту
@@ -287,7 +296,6 @@ class Stats:
         cycle_ms:    float,
         written:     int,
         skipped:     int,
-        below:       int,
         activated:   int,
         expired:     int,
         active_now:  int,
@@ -299,8 +307,6 @@ class Stats:
         self.writes_window += written
         self.skipped_total  += skipped
         self.skipped_window += skipped
-        self.below_total    += below
-        self.below_window   += below
         self.activated_total += activated
         self.expired_total   += expired
         self.active_now       = active_now
@@ -321,10 +327,9 @@ class Stats:
         self.cycles_window   = 0
         self.writes_window   = 0
         self.skipped_window  = 0
-        self.below_window    = 0
         self.errors_window   = 0
         self.overruns_window = 0
-        # activated/expired/active_now — не сбрасываем (total-метрики)
+        # activated_total / expired_total / active_now — не сбрасываем
         self.pipeline_ms_window.clear()
         self.write_ms_window.clear()
         self.cycle_ms_window.clear()
@@ -363,35 +368,6 @@ def _latency_stats(samples: List[float]) -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Загрузка направлений из combination/
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_directions() -> List[Tuple[str, str, List[str]]]:
-    """
-    Читает файлы {spot_exch}_spot_{fut_exch}_futures.txt из COMBINATION_DIR.
-    Возвращает список (spot_exch, fut_exch, [symbols]).
-    """
-    result = []
-    if not COMBINATION_DIR.exists():
-        return result
-    for fpath in sorted(COMBINATION_DIR.glob("*_spot_*_futures.txt")):
-        stem  = fpath.stem   # e.g. "binance_spot_bybit_futures"
-        parts = stem.split("_spot_")
-        if len(parts) != 2:
-            continue
-        spot_exch = parts[0]
-        fut_exch  = parts[1].replace("_futures", "")
-        symbols = [
-            line.strip().upper()
-            for line in fpath.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-        if symbols:
-            result.append((spot_exch, fut_exch, symbols))
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Redis
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -423,7 +399,6 @@ async def create_redis() -> aioredis.Redis:
 
 async def write_loop(
     redis_client: aioredis.Redis,
-    pairs:        List[Tuple[str, str, str]],   # [(spot_exch, fut_exch, symbol)]
     log:          LogManager,
     stats:        Stats,
     fhm:          FileHandleManager,
@@ -431,24 +406,19 @@ async def write_loop(
     """
     Каждые WRITE_INTERVAL секунд:
       1. Ротация файловых дескрипторов при смене часа.
-      2. Redis pipeline — читаем ask_spot и bid_futures для всех пар.
-      3. Для каждой пары:
-           - нет данных → skipped
-           - спред >= MIN_SPREAD_PCT и пара ещё не в active_windows → открываем окно
-           - пара в active_windows и elapsed >= SNAPSHOT_DURATION → закрываем окно (навсегда)
-           - пара в active_windows и elapsed < SNAPSHOT_DURATION → пишем строку
-           - иначе → below_threshold
-      4. Сброс буферов файлов.
-      5. Ожидание до следующего цикла.
+      2. HGETALL signals:active — читаем пары, у которых signal_scanner нашёл сигнал.
+      3. Открываем окна для новых пар (если timestamp свежий и пара не в expired).
+      4. Проверяем истечение окон (SNAPSHOT_DURATION).
+      5. Для пар с открытым окном читаем текущие цены и пишем снапшот.
+      6. Сброс буферов, ожидание.
 
-    active_windows: Dict[(spot, fut, sym) → start_ts]
-      Пара попадает сюда при первом пересечении порога и остаётся
-      до истечения SNAPSHOT_DURATION секунд, после чего удаляется навсегда.
+    active_windows: {(spot, fut, sym) → window_start_ts}
+    expired_pairs:  set() — пары, чьё окно уже истекло (больше не запускаем)
     """
-    # (spot_exch, fut_exch, symbol) → timestamp первого сигнала
+    # (spot_exch, fut_exch, symbol) → timestamp открытия окна
     active_windows: Dict[Tuple[str, str, str], float] = {}
-    # пары, у которых окно уже истекло — больше не запускаем
-    expired_pairs:  set = set()
+    # пары, у которых окно уже истекло навсегда
+    expired_pairs: set = set()
 
     while True:
         cycle_t0 = time.perf_counter()
@@ -458,83 +428,133 @@ async def write_loop(
         # ── 1. Ротация часа ───────────────────────────────────────────────────
         fhm.check_rotate()
 
-        # ── 2. Redis pipeline ─────────────────────────────────────────────────
-        pipe = redis_client.pipeline(transaction=False)
-        for spot_exch, fut_exch, sym in pairs:
-            pipe.hmget(f"md:{spot_exch}:spot:{sym}",   "ask", "ts")
-            pipe.hmget(f"md:{fut_exch}:futures:{sym}", "bid", "ts")
-
-        pipe_t0 = time.perf_counter()
+        # ── 2. Читаем signals:active из Redis ─────────────────────────────────
+        # {ckey: last_signal_ts_str}, ckey = "{spot}:{fut}:{sym}"
         try:
-            results = await pipe.execute()
+            raw_active = await redis_client.hgetall(SIGNALS_ACTIVE_KEY)
         except Exception as exc:
             err = repr(exc)[:200]
             stats.record_error(err)
-            log.write({
-                "type":  "error",
-                "ts":    _now_iso(),
-                "phase": "redis_pipeline",
-                "error": err,
-            })
+            log.write({"type": "error", "ts": _now_iso(),
+                       "phase": "hgetall_signals_active", "error": err})
             await asyncio.sleep(WRITE_INTERVAL)
             continue
-        pipeline_ms = (time.perf_counter() - pipe_t0) * 1000
 
-        # ── 3. Обработка результатов ──────────────────────────────────────────
-        write_t0  = time.perf_counter()
-        written   = 0
-        skipped   = 0   # нет данных в Redis
-        below     = 0   # спред ниже порога, окно не открыто
-        activated = 0   # пар, у которых открылось окно в этом цикле
-        expired   = 0   # пар, у которых окно закрылось в этом цикле
-
-        for i, (spot_exch, fut_exch, sym) in enumerate(pairs):
-            key      = (spot_exch, fut_exch, sym)
-            spot_row = results[i * 2]      # [ask, ts]
-            fut_row  = results[i * 2 + 1]  # [bid, ts]
-
-            # ── A. Нет данных в Redis ─────────────────────────────────────────
-            if not spot_row or spot_row[0] is None:
-                skipped += 1
+        # ── 3. Открываем окна для новых активных пар ──────────────────────────
+        activated = 0
+        for ckey, ts_str in raw_active.items():
+            parts = ckey.split(":")
+            if len(parts) != 3:
                 continue
-            if not fut_row or fut_row[0] is None:
-                skipped += 1
+            spot_exch, fut_exch, sym = parts
+            key = (spot_exch, fut_exch, sym)
+
+            if key in expired_pairs or key in active_windows:
                 continue
+
             try:
-                ask_spot    = float(spot_row[0])
-                bid_futures = float(fut_row[0])
-            except (TypeError, ValueError):
-                skipped += 1
-                continue
-            if ask_spot <= 0:
-                skipped += 1
+                signal_ts = float(ts_str)
+            except (ValueError, TypeError):
                 continue
 
-            spread_pct = (bid_futures - ask_spot) / ask_spot * 100
-
-            # ── B. Окно уже истекло — пара заблокирована навсегда ─────────────
-            if key in expired_pairs:
+            # Открываем окно только если сигнал свежий (signal_scanner жив)
+            if now - signal_ts > SIGNAL_FRESHNESS:
                 continue
 
-            # ── C. Окно активно — проверяем таймаут или пишем ────────────────
-            if key in active_windows:
-                elapsed = now - active_windows[key]
-                if elapsed >= SNAPSHOT_DURATION:
-                    # Окно закрылось — переносим в expired, логируем
-                    del active_windows[key]
-                    expired_pairs.add(key)
-                    expired += 1
-                    log.write({
-                        "type":        "window_expired",
-                        "ts":          _now_iso(),
-                        "spot_exch":   spot_exch,
-                        "fut_exch":    fut_exch,
-                        "symbol":      sym,
-                        "duration_s":  round(elapsed, 1),
-                        "spread_pct":  round(spread_pct, 4),
-                    })
+            active_windows[key] = now
+            activated += 1
+            log.write({
+                "type":       "window_opened",
+                "ts":         _now_iso(),
+                "spot_exch":  spot_exch,
+                "fut_exch":   fut_exch,
+                "symbol":     sym,
+                "duration_s": SNAPSHOT_DURATION,
+            })
+            print(
+                f"[{SCRIPT_NAME}] window_opened {spot_exch}→{fut_exch} {sym} "
+                f"duration={SNAPSHOT_DURATION:.0f}s",
+                flush=True,
+            )
+
+        # ── 4. Проверяем истечение окон ───────────────────────────────────────
+        expired = 0
+        expired_now: List[Tuple[str, str, str]] = []
+        for key, start_ts in active_windows.items():
+            if now - start_ts >= SNAPSHOT_DURATION:
+                expired_now.append(key)
+
+        for key in expired_now:
+            del active_windows[key]
+            expired_pairs.add(key)
+            expired += 1
+            spot_exch, fut_exch, sym = key
+            elapsed = now - active_windows.get(key, now)  # уже удалён, для лога
+            log.write({
+                "type":       "window_expired",
+                "ts":         _now_iso(),
+                "spot_exch":  spot_exch,
+                "fut_exch":   fut_exch,
+                "symbol":     sym,
+                "duration_s": SNAPSHOT_DURATION,
+            })
+            print(
+                f"[{SCRIPT_NAME}] window_expired {spot_exch}→{fut_exch} {sym}",
+                flush=True,
+            )
+            # Убираем из signals:active чтобы signal_scanner мог переиспользовать
+            try:
+                await redis_client.hdel(SIGNALS_ACTIVE_KEY, f"{spot_exch}:{fut_exch}:{sym}")
+            except Exception:
+                pass
+
+        # ── 5. Читаем цены для открытых окон и пишем снапшоты ────────────────
+        written = 0
+        skipped = 0
+        pipeline_ms = 0.0
+
+        if active_windows:
+            window_list = list(active_windows.keys())  # [(spot, fut, sym), ...]
+
+            pipe = redis_client.pipeline(transaction=False)
+            for spot_exch, fut_exch, sym in window_list:
+                pipe.hmget(f"md:{spot_exch}:spot:{sym}",   "ask", "ts")
+                pipe.hmget(f"md:{fut_exch}:futures:{sym}", "bid", "ts")
+
+            pipe_t0 = time.perf_counter()
+            try:
+                results = await pipe.execute()
+            except Exception as exc:
+                err = repr(exc)[:200]
+                stats.record_error(err)
+                log.write({"type": "error", "ts": _now_iso(),
+                           "phase": "redis_pipeline", "error": err})
+                await asyncio.sleep(WRITE_INTERVAL)
+                continue
+            pipeline_ms = (time.perf_counter() - pipe_t0) * 1000
+
+            write_t0 = time.perf_counter()
+            for i, (spot_exch, fut_exch, sym) in enumerate(window_list):
+                spot_row = results[i * 2]
+                fut_row  = results[i * 2 + 1]
+
+                if not spot_row or spot_row[0] is None:
+                    skipped += 1
                     continue
-                # Окно ещё активно — пишем строку
+                if not fut_row or fut_row[0] is None:
+                    skipped += 1
+                    continue
+                try:
+                    ask_spot    = float(spot_row[0])
+                    bid_futures = float(fut_row[0])
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                if ask_spot <= 0:
+                    skipped += 1
+                    continue
+
+                spread_pct = (bid_futures - ask_spot) / ask_spot * 100
                 line = (
                     f"{spot_exch},{fut_exch},{sym},"
                     f"{ask_spot},{bid_futures},"
@@ -553,73 +573,35 @@ async def write_loop(
                         "pair":  f"{spot_exch}_s_{fut_exch}_f_{sym}",
                         "error": err,
                     })
-                continue
 
-            # ── D. Окно не открыто — проверяем, достиг ли порога ─────────────
-            if spread_pct >= MIN_SPREAD_PCT:
-                # Открываем окно записи
-                active_windows[key] = now
-                activated += 1
-                log.write({
-                    "type":       "window_opened",
-                    "ts":         _now_iso(),
-                    "spot_exch":  spot_exch,
-                    "fut_exch":   fut_exch,
-                    "symbol":     sym,
-                    "spread_pct": round(spread_pct, 4),
-                    "duration_s": SNAPSHOT_DURATION,
-                })
-                # Сразу пишем первую строку
-                line = (
-                    f"{spot_exch},{fut_exch},{sym},"
-                    f"{ask_spot},{bid_futures},"
-                    f"{spread_pct:.4f},{ts_ms}\n"
-                )
-                try:
-                    fhm.get(spot_exch, fut_exch, sym).write(line)
-                    written += 1
-                except Exception as exc:
-                    err = repr(exc)[:200]
-                    stats.record_error(err)
-                    log.write({
-                        "type":  "error",
-                        "ts":    _now_iso(),
-                        "phase": "file_write",
-                        "pair":  f"{spot_exch}_s_{fut_exch}_f_{sym}",
-                        "error": err,
-                    })
-            else:
-                below += 1
+            fhm.flush_all()
+            write_ms = (time.perf_counter() - write_t0) * 1000
+        else:
+            write_ms = 0.0
 
-        # ── 4. Сброс буферов ──────────────────────────────────────────────────
-        fhm.flush_all()
-        write_ms = (time.perf_counter() - write_t0) * 1000
-
-        # ── 5. Учёт статистики ────────────────────────────────────────────────
+        # ── 6. Учёт статистики ────────────────────────────────────────────────
         cycle_ms = (time.perf_counter() - cycle_t0) * 1000
         overrun  = cycle_ms > WRITE_INTERVAL * 1000 * OVERRUN_THRESHOLD
         stats.record_cycle(
             pipeline_ms, write_ms, cycle_ms,
-            written, skipped, below, activated, expired,
+            written, skipped, activated, expired,
             len(active_windows), overrun,
         )
 
         if overrun:
             log.write({
-                "type":            "warning",
-                "ts":              _now_iso(),
-                "msg":             "cycle_overrun",
-                "cycle_ms":        round(cycle_ms, 2),
-                "target_ms":       round(WRITE_INTERVAL * 1000, 1),
-                "pipeline_ms":     round(pipeline_ms, 2),
-                "write_ms":        round(write_ms, 2),
-                "written":         written,
-                "skipped":         skipped,
-                "below_threshold": below,
-                "active_windows":  len(active_windows),
+                "type":           "warning",
+                "ts":             _now_iso(),
+                "msg":            "cycle_overrun",
+                "cycle_ms":       round(cycle_ms, 2),
+                "target_ms":      round(WRITE_INTERVAL * 1000, 1),
+                "pipeline_ms":    round(pipeline_ms, 2),
+                "write_ms":       round(write_ms, 2),
+                "written":        written,
+                "active_windows": len(active_windows),
             })
 
-        # ── 6. Сон до следующего цикла ────────────────────────────────────────
+        # ── 7. Сон до следующего цикла ────────────────────────────────────────
         sleep_time = max(0.0, WRITE_INTERVAL - cycle_ms / 1000)
         if sleep_time > 0:
             await asyncio.sleep(sleep_time)
@@ -629,11 +611,7 @@ async def write_loop(
 # Цикл снапшотов в лог
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def snapshot_loop(
-    log:         LogManager,
-    stats:       Stats,
-    total_pairs: int,
-) -> None:
+async def snapshot_loop(log: LogManager, stats: Stats) -> None:
     """Каждые LOG_SNAPSHOT_EVERY секунд пишет JSON-снапшот в лог и stdout."""
     last_ts = time.time()
 
@@ -651,11 +629,10 @@ async def snapshot_loop(
             "uptime_s": round(now - stats.start_ts, 1),
 
             "config": {
-                "write_interval_s": WRITE_INTERVAL,
-                "min_spread_pct":   MIN_SPREAD_PCT,
+                "write_interval_s":    WRITE_INTERVAL,
                 "snapshot_duration_s": SNAPSHOT_DURATION,
-                "total_pairs":      total_pairs,
-                "snapshots_dir":    str(SNAPSHOTS_DIR),
+                "signal_freshness_s":  SIGNAL_FRESHNESS,
+                "snapshots_dir":       str(SNAPSHOTS_DIR),
             },
 
             "cycles": {
@@ -673,13 +650,7 @@ async def snapshot_loop(
             "skipped": {
                 "total":  stats.skipped_total,
                 "window": stats.skipped_window,
-                "reason": "no_redis_data",
-            },
-
-            "below_threshold": {
-                "total":     stats.below_total,
-                "window":    stats.below_window,
-                "threshold": MIN_SPREAD_PCT,
+                "reason": "no_redis_data_for_active_window",
             },
 
             "windows": {
@@ -715,12 +686,11 @@ async def snapshot_loop(
 
         print(
             f"[{SCRIPT_NAME}] "
-            f"cycles={stats.cycles_total:,}({stats.cycles_window}/win) "
-            f"writes={stats.writes_total:,} rate={rate_writes:.0f}/s | "
+            f"cycles={stats.cycles_total:,} writes={stats.writes_total:,} "
+            f"rate={rate_writes:.0f}/s | "
             f"active={stats.active_now} activated={stats.activated_total} "
             f"expired={stats.expired_total} | "
             f"pipe={snap['pipeline_latency_ms']['avg']:.2f}ms "
-            f"write={snap['write_latency_ms']['avg']:.2f}ms | "
             f"err={stats.errors_total}",
             flush=True,
         )
@@ -742,36 +712,16 @@ async def main() -> None:
         "config": {
             "redis":               f"{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}",
             "write_interval_s":    WRITE_INTERVAL,
-            "min_spread_pct":      MIN_SPREAD_PCT,
             "snapshot_duration_s": SNAPSHOT_DURATION,
+            "signal_freshness_s":  SIGNAL_FRESHNESS,
+            "signals_active_key":  SIGNALS_ACTIVE_KEY,
             "snapshots_dir":       str(SNAPSHOTS_DIR),
-            "combination_dir":     str(COMBINATION_DIR),
         },
     })
     print(f"[{SCRIPT_NAME}] Запуск...", flush=True)
-
-    directions = load_directions()
-    if not directions:
-        msg = f"Не найдено файлов направлений в {COMBINATION_DIR}"
-        log.write({"type": "fatal", "ts": _now_iso(), "error": msg})
-        print(f"[{SCRIPT_NAME}] FATAL: {msg}", flush=True)
-        sys.exit(1)
-
-    # Флаттенизируем пары один раз — это единственный рабочий список
-    pairs: List[Tuple[str, str, str]] = [
-        (spot_exch, fut_exch, sym)
-        for spot_exch, fut_exch, symbols in directions
-        for sym in symbols
-    ]
-
-    log.write({
-        "type":       "directions_loaded",
-        "ts":         _now_iso(),
-        "directions": len(directions),
-        "pairs":      len(pairs),
-    })
     print(
-        f"[{SCRIPT_NAME}] Направлений: {len(directions)}, пар: {len(pairs)}",
+        f"[{SCRIPT_NAME}] Ожидаю сигналы в Redis key '{SIGNALS_ACTIVE_KEY}' "
+        f"(пишет signal_scanner.py)",
         flush=True,
     )
 
@@ -792,10 +742,10 @@ async def main() -> None:
     fhm   = FileHandleManager()
 
     write_task = asyncio.create_task(
-        write_loop(redis_client, pairs, log, stats, fhm)
+        write_loop(redis_client, log, stats, fhm)
     )
     snap_task = asyncio.create_task(
-        snapshot_loop(log, stats, len(pairs))
+        snapshot_loop(log, stats)
     )
 
     try:
