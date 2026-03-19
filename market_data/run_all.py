@@ -80,6 +80,7 @@ SCRIPTS = [
     "okx_futures.py",
     "gate_spot.py",
     "gate_futures.py",
+    "redis_monitor.py",
 ]
 
 SNAPSHOT_INTERVAL    = 10   # секунд между выводом статуса
