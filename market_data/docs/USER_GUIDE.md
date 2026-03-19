@@ -1,70 +1,93 @@
-# User Guide — Скрипты сборщиков
-
-## Общие принципы
-
-Каждый скрипт автономен: подключается к одной бирже по WebSocket, собирает best bid/ask по всем символам из своего файла подписки и пишет в Redis. Все скрипты имеют одинаковую структуру запуска и идентичное поведение при ошибках.
-
----
+# User Guide — Запуск и эксплуатация системы
 
 ## Запуск
 
-### Все 8 скриптов сразу (рекомендуется)
+### Вся система (рекомендуется)
+
+```bash
+# Из корня проекта
+python3 run.py
+```
+
+При запуске:
+1. Удаляются все `md:*` ключи в Redis (чистый старт)
+2. Предлагается очистить папку `logs/`
+3. Запускаются 10 процессов: 8 коллекторов + signal_scanner + redis_monitor
+4. Каждые 10 секунд — снапшот состояния всех процессов
+
+**Остановка:** `Ctrl+C` → graceful shutdown в течение 5 секунд.
+
+---
+
+### Только коллекторы (без сканера и мониторинга)
 
 ```bash
 python3 market_data/run_all.py
 ```
 
-При запуске:
-1. Автоматически удаляются все `md:*` ключи из Redis
-2. Предлагается очистить папку `logs/`
-3. Запускаются все 8 скриптов как отдельные процессы с автоперезапуском
+Запускает только 8 WebSocket-коллекторов. Полезно если сканер и мониторинг запускаются отдельно.
 
-Остановка: `Ctrl+C` (SIGINT) → graceful shutdown всех процессов в течение 5 секунд.
+---
 
-### Один скрипт отдельно (для отладки)
+### Один скрипт отдельно (отладка)
 
 ```bash
 python3 market_data/binance_spot.py
 python3 market_data/bybit_futures.py
-# и т.д.
+python3 signal_scanner.py
+python3 market_data/redis_monitor.py
 ```
 
 ---
 
-## Файлы подписки (списки символов)
+## Предварительное условие: списки торговых пар
 
-Каждый скрипт загружает символы из:
+Перед первым запуском нужно сгенерировать файлы подписки:
+
+```bash
+cd dictionaries
+python3 main.py   # ~2 минуты
+cd ..
+```
+
+Результат: файлы в `dictionaries/subscribe/` (читают коллекторы) и `dictionaries/combination/` (читает signal_scanner).
+
+Обновлять пары рекомендуется раз в сутки — состав активных пар на биржах меняется.
+
+---
+
+## Файлы подписки коллекторов
+
+Каждый коллектор загружает символы из:
 ```
 dictionaries/subscribe/{exchange}/{exchange}_{market}.txt
 ```
 
-| Скрипт            | Файл подписки                                  |
-|-------------------|------------------------------------------------|
-| binance_spot      | `dictionaries/subscribe/binance/binance_spot.txt`    |
-| binance_futures   | `dictionaries/subscribe/binance/binance_futures.txt` |
-| bybit_spot        | `dictionaries/subscribe/bybit/bybit_spot.txt`        |
-| bybit_futures     | `dictionaries/subscribe/bybit/bybit_futures.txt`     |
-| okx_spot          | `dictionaries/subscribe/okx/okx_spot.txt`            |
-| okx_futures       | `dictionaries/subscribe/okx/okx_futures.txt`         |
-| gate_spot         | `dictionaries/subscribe/gate/gate_spot.txt`          |
-| gate_futures      | `dictionaries/subscribe/gate/gate_futures.txt`       |
+| Скрипт            | Файл подписки                                              |
+|-------------------|------------------------------------------------------------|
+| binance_spot      | `dictionaries/subscribe/binance/binance_spot.txt`          |
+| binance_futures   | `dictionaries/subscribe/binance/binance_futures.txt`       |
+| bybit_spot        | `dictionaries/subscribe/bybit/bybit_spot.txt`              |
+| bybit_futures     | `dictionaries/subscribe/bybit/bybit_futures.txt`           |
+| okx_spot          | `dictionaries/subscribe/okx/okx_spot.txt`                  |
+| okx_futures       | `dictionaries/subscribe/okx/okx_futures.txt`               |
+| gate_spot         | `dictionaries/subscribe/gate/gate_spot.txt`                |
+| gate_futures      | `dictionaries/subscribe/gate/gate_futures.txt`             |
 
-**Формат файла:** один символ на строку, uppercase. Строки начинающиеся с `#` — комментарии.
+**Формат файла:** один символ на строку, uppercase. Строки с `#` — комментарии.
 
 ```
 # Bitcoin
 BTCUSDT
-# Ethereum
 ETHUSDT
-ADAUSDT
 SOLUSDT
 ```
 
-**Добавить символ:** просто добавить строку в файл и перезапустить скрипт.
+**Добавить символ:** вписать в файл и перезапустить скрипт.
 
 ---
 
-## Как читать вывод (снапшот каждые 10с)
+## Как читать снапшот коллектора (каждые 10с)
 
 ```
 ================================================================
@@ -92,57 +115,102 @@ Uptime: 0h 00m 10s  |  Symbols: 150  |  Reconnects: 0
 ================================================================
 ```
 
-| Поле            | Что означает                                      |
-|-----------------|---------------------------------------------------|
-| `messages`      | Кол-во WS-сообщений за последние 10 секунд        |
-| `t.writes`      | Записей тикеров в Redis за 10с                    |
-| `h.entries`     | Записей в историю за 10с                          |
-| `RTT`           | Задержка биржа → скрипт (только где есть ts)      |
-| `Proc`          | Задержка получение → запись в Redis               |
-| `chunk_id`      | Номер текущего 20-минутного чанка истории         |
-| `remaining`     | Сколько секунд до следующей ротации чанка         |
+| Поле            | Что означает                                          |
+|-----------------|-------------------------------------------------------|
+| `messages`      | WS-сообщений за последние 10с                         |
+| `t.writes`      | Записей тикеров в Redis за 10с                        |
+| `h.entries`     | Записей в историю (List) за 10с                       |
+| `RTT`           | Задержка биржа → скрипт (где есть exchange ts)        |
+| `Proc`          | Задержка получение → запись в Redis                   |
+| `chunk_id`      | Номер текущего 20-минутного чанка истории             |
+| `remaining`     | Секунд до следующей ротации чанка                     |
+
+---
+
+## Как читать снапшот signal_scanner (каждые 10с)
+
+Пишется в лог `logs/signal_scanner/.../signal_scanner.log` и в stdout.
+
+```json
+{
+  "type": "snapshot",
+  "timestamp": "2024-03-01T12:00:10.451Z",
+  "uptime_s": 600,
+  "pairs_loaded": 320,
+  "min_spread_pct": 1.5,
+  "scans_total": 3000,
+  "scans_window": 50,
+  "signals_total": 7,
+  "signals_window": 1,
+  "pipeline_ms": {"min": 0.8, "avg": 1.2, "p95": 2.1, "max": 3.4},
+  "data_age_ms":  {"min": 12,  "avg": 35,  "p95": 90,  "max": 210}
+}
+```
+
+| Поле             | Что означает                                          |
+|------------------|-------------------------------------------------------|
+| `pairs_loaded`   | Пар загружено из combination/ (по всем 12 файлам)    |
+| `scans_total`    | Всего проходов сканирования                           |
+| `signals_total`  | Всего сигналов с момента запуска                      |
+| `pipeline_ms`    | Время выполнения Redis pipeline (мс)                  |
+| `data_age_ms`    | Возраст данных в Redis (now − ts тикера)              |
+
+---
+
+## Как читать метрики redis_monitor (каждые 5с)
+
+По умолчанию пишется в JSON Lines (`MONITOR_LOG_JSON=1`).
+
+Пример одной строки лога:
+```json
+{
+  "timestamp": "2024-03-01T12:00:10Z",
+  "latency_ping": {"min_ms": 0.12, "avg_ms": 0.18, "p95_ms": 0.31, "max_ms": 0.45},
+  "memory": {"used_human": "45.2M", "peak_human": "48.1M", "fragmentation_ratio": 1.05},
+  "connections": {"connected_clients": 11, "rejected_connections": 0},
+  "ops": {"instantaneous_ops_per_sec": 2340, "instantaneous_input_kbps": 180.5},
+  "keyspace": {"db_total_keys": 12450, "md_keys": 12430},
+  "slowlog_len": 0
+}
+```
 
 ---
 
 ## Поведение при ошибках
 
-### Разрыв WebSocket соединения
+### Разрыв WebSocket соединения (внутри скрипта)
 
-Скрипт автоматически переподключается с экспоненциальной задержкой:
+Автоматическое переподключение с экспоненциальной задержкой:
 
 ```
-Соединение упало → ждать 1s → переподключение
-Снова упало     → ждать 2s → переподключение
-Снова упало     → ждать 4s → переподключение
+Упало → ждать 1s → реконнект
+Снова → ждать 2s → реконнект
+Снова → ждать 4s → реконнект
 ...
-Максимум        → 60s между попытками
+Максимум         → 60s
 ```
 
-Если соединение держалось ≥ 60 секунд — задержка сбрасывается до 1s.
+Если соединение держалось ≥ 60с — задержка сбрасывается до 1s. Счётчик переподключений виден в снапшоте (`reconnects=N`).
 
-Счётчик переподключений виден в снапшоте (`reconnects=N`).
-
-### Падение всего скрипта (только при run_all.py)
-
-`run_all.py` отслеживает процессы и перезапускает с той же логикой:
+### Падение всего скрипта (через run.py / run_all.py)
 
 ```
-Процесс упал → ждать 1s → перезапуск
+Упал → ждать 1s → перезапуск
 ...
-Максимум     → 120s между попытками
+Максимум         → 120s
 ```
 
-Если процесс жил ≥ 300 секунд — задержка сбрасывается до 1s.
+Если процесс жил ≥ 300с — задержка сбрасывается до 1s.
 
 ### Redis недоступен при старте
 
-Скрипт делает 5 попыток с exponential backoff (1s → 2s → 4s → 8s → 16s), затем завершается с ошибкой.
+5 попыток с backoff 1s → 2s → 4s → 8s → 16s, затем выход с ошибкой.
 
 ---
 
-## Как проверить что данные поступают
+## Проверка поступления данных
 
-### Посмотреть тикер
+### Посмотреть тикер в Redis
 
 ```bash
 redis-cli HGETALL md:binance:spot:BTCUSDT
@@ -154,145 +222,103 @@ redis-cli HGETALL md:binance:spot:BTCUSDT
 # 6) "1710000000.123"
 ```
 
-### Посмотреть историю
-
-```bash
-redis-cli LRANGE md:hist:binance:spot:BTCUSDT:1 0 4
-# 1) "1710000000.123,45000.12,45000.13"
-# 2) "1710000001.456,45000.14,45000.15"
-# ...
-```
-
-### Количество ключей в Redis
-
-```bash
-redis-cli --scan --pattern 'md:*' | wc -l
-```
-
 ### Убедиться, что данные обновляются
 
 ```bash
 watch -n 1 'redis-cli HGET md:bybit:spot:BTCUSDT ts'
 ```
 
+### Посмотреть историю
+
+```bash
+redis-cli LRANGE md:hist:binance:spot:BTCUSDT:1 0 4
+# 1) "1710000000.123,45000.12,45000.13"
+# 2) "1710000001.456,45000.14,45000.15"
+```
+
+### Количество активных тикеров
+
+```bash
+redis-cli --scan --pattern 'md:*' | wc -l
+```
+
+### Последние сигналы
+
+```bash
+tail -20 signal/signals.csv
+```
+
 ---
 
-## Отдельные скрипты — особенности
-
----
+## Особенности каждого коллектора
 
 ### binance_spot.py
 
-**WebSocket:** `wss://stream.binance.com:9443/stream?streams=...`
-**Канал:** `{symbol}@bookTicker` — самые быстрые обновления best bid/ask
-**Лимит:** 300 символов на одно соединение
-**RTT:** недоступен (Binance не включает timestamp в bookTicker)
-
-Подписка встроена прямо в URL:
-```
-wss://...?streams=btcusdt@bookTicker/ethusdt@bookTicker/...
-```
-
----
+- **WS:** `wss://stream.binance.com:9443/stream?streams=...`
+- **Канал:** `{symbol}@bookTicker` — самые быстрые обновления
+- **Лимит:** 300 символов / соединение
+- **RTT:** недоступен (Binance не включает ts в bookTicker)
+- Стримы встроены в URL соединения
 
 ### binance_futures.py
 
-**WebSocket:** `wss://fstream.binance.com/stream?streams=...`
-**Канал:** `{symbol}@bookTicker`
-Идентичен `binance_spot.py`, отличается только хостом.
-
----
+- **WS:** `wss://fstream.binance.com/stream?streams=...`
+- Идентичен binance_spot, отличается только хостом
 
 ### bybit_spot.py
 
-**WebSocket:** `wss://stream.bybit.com/v5/public/spot`
-**Канал:** `orderbook.1.{SYMBOL}` — L1 стакан (только лучший уровень)
-**Лимит:** 200 символов на соединение, батчи по 10 символов в подписке
-**Ping:** каждые 20 секунд `{"op":"ping"}`
-**RTT:** доступен (поле `ts` в миллисекундах)
-
-Подписка отправляется отдельными сообщениями после установки соединения:
-```json
-{"op":"subscribe","args":["orderbook.1.BTCUSDT","orderbook.1.ETHUSDT",...]}
-```
-
----
+- **WS:** `wss://stream.bybit.com/v5/public/spot`
+- **Канал:** `orderbook.1.{SYMBOL}` (L1 стакан)
+- **Лимит:** 200 символов / соединение, батч подписки по 10
+- **Пинг:** `{"op":"ping"}` каждые 20с
+- **RTT:** доступен (поле `ts` в мс)
 
 ### bybit_futures.py
 
-**WebSocket:** `wss://stream.bybit.com/v5/public/linear`
-**Канал:** `orderbook.1.{SYMBOL}`
-Идентичен `bybit_spot.py`, отличается URL и лимитом батча (200 вместо 10).
-
----
+- **WS:** `wss://stream.bybit.com/v5/public/linear`
+- Идентичен bybit_spot, батч подписки по 200
 
 ### okx_spot.py
 
-**WebSocket:** `wss://ws.okx.com:8443/ws/v5/public`
-**Канал:** `tickers` с `instId: "BTC-USDT"` (формат с дефисом)
-**Лимит:** 300 символов на соединение
-**Ping:** строка `"ping"` каждые 25 секунд, ответ `"pong"`
-**RTT:** доступен (поле `ts` — строка в мс)
-
-Конвертация символов: `BTCUSDT` → `BTC-USDT` (при подписке) → `BTCUSDT` (при записи).
-
-```json
-{"op":"subscribe","args":[{"channel":"tickers","instId":"BTC-USDT"},...]}
-```
-
----
+- **WS:** `wss://ws.okx.com:8443/ws/v5/public`
+- **Канал:** `tickers` с `instId: "BTC-USDT"`
+- **Лимит:** 300 инструментов / соединение
+- **Пинг:** строка `"ping"` каждые 25с
+- **RTT:** доступен
+- Конвертация: `BTCUSDT` → `BTC-USDT` (подписка) → `BTCUSDT` (Redis)
 
 ### okx_futures.py
 
-**WebSocket:** `wss://ws.okx.com:8443/ws/v5/public`
-**Канал:** `tickers` с `instId: "BTC-USDT-SWAP"`
-Конвертация: `BTCUSDT` → `BTC-USDT-SWAP` → `BTCUSDT`.
-
-```json
-{"op":"subscribe","args":[{"channel":"tickers","instId":"BTC-USDT-SWAP"},...]}
-```
-
----
+- **WS:** `wss://ws.okx.com:8443/ws/v5/public`
+- **Канал:** `tickers` с `instId: "BTC-USDT-SWAP"`
+- Конвертация: `BTCUSDT` → `BTC-USDT-SWAP` → `BTCUSDT`
 
 ### gate_spot.py
 
-**WebSocket:** `wss://api.gateio.ws/ws/v4/`
-**Канал:** `spot.book_ticker`
-**Лимит:** 500 символов на соединение, батчи по 100 с задержкой 50ms между батчами
-**Ping:** `{"channel":"spot.ping","time":<unix_ts>}` каждые 25с
-**RTT:** доступен (поле `result.t` в миллисекундах)
-
-Конвертация: `BTCUSDT` → `BTC_USDT` → `BTCUSDT`.
-
-```json
-{
-  "time": 1710000000,
-  "channel": "spot.book_ticker",
-  "event": "subscribe",
-  "payload": ["BTC_USDT","ETH_USDT",...]
-}
-```
-
----
+- **WS:** `wss://api.gateio.ws/ws/v4/`
+- **Канал:** `spot.book_ticker`
+- **Лимит:** 500 символов / соединение, батч по 100 с паузой 50ms
+- **Пинг:** `{"channel":"spot.ping","time":<ts>}` каждые 25с
+- **RTT:** доступен
+- Конвертация: `BTCUSDT` → `BTC_USDT` → `BTCUSDT`
 
 ### gate_futures.py
 
-**WebSocket:** `wss://fx-ws.gateio.ws/v4/ws/usdt`
-**Канал:** `futures.book_ticker`
-**Ping:** `{"channel":"futures.ping","time":<unix_ts>}` каждые 25с
-Идентичен `gate_spot.py`, отличается URL и именами каналов.
+- **WS:** `wss://fx-ws.gateio.ws/v4/ws/usdt`
+- **Канал:** `futures.book_ticker`
+- Идентичен gate_spot, отличается URL и именами каналов
 
 ---
 
 ## Отладка
 
-### Запустить один скрипт с выводом в терминал
+### Запустить скрипт с нестандартным Redis
 
 ```bash
-REDIS_HOST=127.0.0.1 python3 market_data/binance_spot.py
+REDIS_HOST=10.0.0.5 REDIS_PASSWORD=secret python3 market_data/binance_spot.py
 ```
 
-### Принудительно сбросить Redis и запустить один скрипт
+### Принудительно сбросить Redis и запустить
 
 ```bash
 redis-cli --scan --pattern 'md:*' | xargs redis-cli DEL
@@ -305,8 +331,20 @@ python3 market_data/binance_spot.py
 ss -tp | grep python
 ```
 
-### Посмотреть задержки в реальном времени (через логи)
+### Следить за задержками в реальном времени
 
 ```bash
-grep "Proc\|RTT" logs/bybit_spot/$(ls -t logs/bybit_spot/ | head -1)/bybit_spot.log | tail -5
+tail -f logs/bybit_spot/$(ls -t logs/bybit_spot/ | head -1)/bybit_spot.log | grep "Proc\|RTT"
+```
+
+### Посмотреть последние ошибки по всем скриптам
+
+```bash
+grep -r "Ошибка\|Error\|error" logs/*/$(ls -t logs/binance_spot/ | head -1)/
+```
+
+### Нагрузочный тест Redis
+
+```bash
+python3 market_data/tests/load_test.py
 ```

@@ -1,7 +1,10 @@
-# dictionaries
+# dictionaries — Генерация списков торговых пар
 
-Модуль генерации и хранения списков торговых пар для 4 бирж.
-Запускается вручную — результат записывается в `subscribe/` и `combination/`, откуда коллекторы `market-data/` читают символы при старте.
+Модуль собирает активные торговые пары с 4 бирж через REST API и валидирует их через WebSocket. Результат записывается в `subscribe/` и `combination/` — эти файлы читает система при старте.
+
+Запускается **вручную или по расписанию** (рекомендуется раз в сутки, состав активных пар меняется).
+
+---
 
 ## Содержание
 
@@ -19,39 +22,39 @@
 
 ```
 dictionaries/
+│
 ├── main.py                        # Оркестратор — запускает всё и печатает отчёт
 │
 ├── binance/
 │   ├── binance_pairs.py           # REST API → spot + futures пары
-│   └── binance_ws.py              # WS-валидация активности пар (bookTicker)
+│   ├── binance_ws.py              # WS-валидация активности пар (bookTicker)
+│   └── data/                      # Промежуточные данные (авто)
+│       ├── binance_spot.txt       # Все пары от REST API
+│       └── binance_spot_active.txt # Прошедшие WS-валидацию
 │
 ├── bybit/
 │   ├── bybit_pairs.py             # REST API → spot + futures пары (cursor-пагинация)
-│   └── bybit_ws.py                # WS-валидация (orderbook.1, кастомный пинг)
+│   ├── bybit_ws.py                # WS-валидация (orderbook.1, кастомный пинг)
+│   └── data/
 │
 ├── okx/
-│   ├── okx_pairs.py               # REST API → SPOT + SWAP пары, нормализация BTC-USDT→BTCUSDT
-│   └── okx_ws.py                  # WS-валидация (tickers, 300 instId/соединение)
+│   ├── okx_pairs.py               # REST API → SPOT + SWAP пары
+│   ├── okx_ws.py                  # WS-валидация (tickers, 300 instId/соединение)
+│   └── data/
+│       ├── okx_spot_native.txt    # Нативный формат OKX (BTC-USDT)
+│       └── okx_spot.txt           # Нормализованный (BTCUSDT)
 │
 ├── gate/
 │   ├── gate_pairs.py              # REST API → spot + futures USDT-маржинальные
-│   └── gate_ws.py                 # WS-валидация (spot/futures.book_ticker, батч 100)
+│   ├── gate_ws.py                 # WS-валидация (spot/futures.book_ticker, батч 100)
+│   └── data/
 │
-├── combination/                   # Генерируется автоматически
+├── combination/                   # 12 файлов пересечений (авто, читает signal_scanner)
 │   ├── binance_spot_bybit_futures.txt
 │   ├── bybit_spot_binance_futures.txt
-│   ├── binance_spot_okx_futures.txt
-│   ├── okx_spot_binance_futures.txt
-│   ├── bybit_spot_okx_futures.txt
-│   ├── okx_spot_bybit_futures.txt
-│   ├── binance_spot_gate_futures.txt
-│   ├── gate_spot_binance_futures.txt
-│   ├── bybit_spot_gate_futures.txt
-│   ├── gate_spot_bybit_futures.txt
-│   ├── okx_spot_gate_futures.txt
-│   └── gate_spot_okx_futures.txt
+│   └── ...
 │
-└── subscribe/                     # Генерируется автоматически — читают коллекторы
+└── subscribe/                     # 8 файлов подписки (авто, читают коллекторы)
     ├── binance/
     │   ├── binance_spot.txt
     │   └── binance_futures.txt
@@ -72,44 +75,51 @@ dictionaries/
 
 ```bash
 # Из корня репозитория
-cd dictionaries
 pip install websockets
-python3 main.py
+python3 dictionaries/main.py
 ```
 
-Скрипт работает ~10 минут (60 сек WS-валидация × 4 биржи параллельно = ~2 мин).
-По завершении печатает итоговый отчёт и обновляет все файлы в `combination/` и `subscribe/`.
+Скрипт работает ~2 минуты (60с WS-валидация × 4 биржи параллельно ≈ ~60с суммарно + REST API). По завершении печатает отчёт и обновляет все файлы в `combination/` и `subscribe/`.
+
+После этого можно запускать всю систему:
+```bash
+python3 run.py
+```
 
 ---
 
 ## Как работает
 
+Выполнение разбито на 5 фаз:
+
 ```
-Для каждой биржи:
-  1. REST API → полный список USDT/USDC пар (spot + futures)
-  2. WebSocket → подписка на все пары, 60 сек наблюдение
-  3. Только пары, ответившие хоть раз → список активных пар
+Фаза 1 — REST API (параллельно, 4 потока):
+  Binance, Bybit, OKX, Gate → полные списки USDT/USDC пар
 
-После всех бирж:
-  4. Пересечения (12 комбинаций) → combination/*.txt
-  5. Subscribe-файлы → subscribe/{exchange}/*.txt
+Фаза 2 — WS-валидация (параллельно, asyncio.gather):
+  60 секунд слушаем WebSocket каждой биржи.
+  Фиксируем пары, по которым пришёл хотя бы 1 ответ.
+  Итог: списки *активных* пар.
 
-Логика subscribe:
-  Каждое ключевое слово в имени combination-файла → свой subscribe-файл.
-  binance_spot_gate_futures.txt → binance_spot.txt + gate_futures.txt
-  Дубли убираются через set().
+Фаза 3 — Построение пересечений (combination/):
+  Все комбинации «spot_A ∩ futures_B» → 12 .txt-файлов
+
+Фаза 4 — Построение файлов подписки (subscribe/):
+  Из combination-файлов агрегируются subscribe-файлы без дублей
+
+Фаза 5 — Отчёт в stdout
 ```
 
 ### Промежуточные данные
 
-Каждый модуль сохраняет промежуточные результаты в свою папку `data/`:
+Каждый модуль сохраняет промежуточные результаты в `data/`:
 
 | Файл | Содержимое |
 |------|-----------|
 | `binance/data/binance_spot.txt` | Все пары от REST API |
-| `binance/data/binance_spot_active.txt` | Только прошедшие WS-валидацию |
+| `binance/data/binance_spot_active.txt` | Прошедшие WS-валидацию |
 | `okx/data/okx_spot_native.txt` | Нативный OKX-формат (BTC-USDT) для WS-подписки |
-| `okx/data/okx_spot.txt` | Нормализованный формат (BTCUSDT) для пересечений |
+| `okx/data/okx_spot.txt` | Нормализованный (BTCUSDT) для пересечений |
 
 ---
 
@@ -135,6 +145,7 @@ python3 main.py
 | WS канал | `orderbook.1.{SYMBOL}` | `orderbook.1.{SYMBOL}` |
 | Батч подписки | 10 символов/запрос | 200 символов/запрос |
 | Пинг | `{"op":"ping"}` | `{"op":"ping"}` |
+| Пагинация | cursor-based | cursor-based |
 
 ### OKX
 
@@ -164,26 +175,28 @@ python3 main.py
 
 ## Пересечения (combination)
 
-12 файлов — все возможные пары из 4 бирж × 2 рынка:
+12 файлов — все возможные пары «spot биржи A × futures биржи B»:
 
 ```
-Обозначение:  A_spot_B_futures = пары, торгующиеся на A-Spot И B-Futures
+Обозначение: A_spot_B_futures = пары, торгующиеся и на A-Spot, и на B-Futures
 
-binance_spot ∩ bybit_futures    →  binance_spot_bybit_futures.txt
-bybit_spot   ∩ binance_futures  →  bybit_spot_binance_futures.txt
-binance_spot ∩ okx_futures      →  binance_spot_okx_futures.txt
-okx_spot     ∩ binance_futures  →  okx_spot_binance_futures.txt
-bybit_spot   ∩ okx_futures      →  bybit_spot_okx_futures.txt
-okx_spot     ∩ bybit_futures    →  okx_spot_bybit_futures.txt
-binance_spot ∩ gate_futures     →  binance_spot_gate_futures.txt
-gate_spot    ∩ binance_futures  →  gate_spot_binance_futures.txt
-bybit_spot   ∩ gate_futures     →  bybit_spot_gate_futures.txt
-gate_spot    ∩ bybit_futures    →  gate_spot_bybit_futures.txt
-okx_spot     ∩ gate_futures     →  okx_spot_gate_futures.txt
-gate_spot    ∩ okx_futures      →  gate_spot_okx_futures.txt
+binance_spot ∩ bybit_futures    →  combination/binance_spot_bybit_futures.txt
+bybit_spot   ∩ binance_futures  →  combination/bybit_spot_binance_futures.txt
+binance_spot ∩ okx_futures      →  combination/binance_spot_okx_futures.txt
+okx_spot     ∩ binance_futures  →  combination/okx_spot_binance_futures.txt
+bybit_spot   ∩ okx_futures      →  combination/bybit_spot_okx_futures.txt
+okx_spot     ∩ bybit_futures    →  combination/okx_spot_bybit_futures.txt
+binance_spot ∩ gate_futures     →  combination/binance_spot_gate_futures.txt
+gate_spot    ∩ binance_futures  →  combination/gate_spot_binance_futures.txt
+bybit_spot   ∩ gate_futures     →  combination/bybit_spot_gate_futures.txt
+gate_spot    ∩ bybit_futures    →  combination/gate_spot_bybit_futures.txt
+okx_spot     ∩ gate_futures     →  combination/okx_spot_gate_futures.txt
+gate_spot    ∩ okx_futures      →  combination/gate_spot_okx_futures.txt
 ```
 
-Каждый файл — список символов (один на строку, BTCUSDT-формат), отсортированный по алфавиту.
+Формат файла: один символ на строку (BTCUSDT), отсортировано по алфавиту.
+
+Эти файлы читает `signal_scanner.py` для определения какие пары проверять.
 
 ---
 
@@ -206,16 +219,14 @@ gate_spot        →  subscribe/gate/gate_spot.txt
 gate_futures     →  subscribe/gate/gate_futures.txt
 ```
 
-Один combination-файл вносит пары сразу в два subscribe-файла. Например,
-`binance_spot_gate_futures.txt` → `binance_spot.txt` + `gate_futures.txt`.
-Дубли между файлами устраняются автоматически.
+Один combination-файл вносит пары сразу в два subscribe-файла. Например, `binance_spot_gate_futures.txt` → `binance_spot.txt` + `gate_futures.txt`. Дубли устраняются автоматически.
 
-Эти файлы читают коллекторы `market-data/` при запуске:
+Эти файлы читают коллекторы `market_data/` при запуске:
 
 ```bash
 # Проверить сколько пар загружено
-wc -l subscribe/binance/binance_spot.txt
-wc -l subscribe/bybit/bybit_futures.txt
+wc -l dictionaries/subscribe/binance/binance_spot.txt
+wc -l dictionaries/subscribe/bybit/bybit_futures.txt
 ```
 
 ---
@@ -226,6 +237,4 @@ wc -l subscribe/bybit/bybit_futures.txt
 pip install websockets
 ```
 
-Стандартная библиотека Python используется для REST API (`urllib.request`).
-`websockets` — для WS-валидации.
-Python 3.11+.
+Стандартная библиотека Python используется для REST API (`urllib.request`). `websockets` — для WS-валидации. Python 3.11+.
