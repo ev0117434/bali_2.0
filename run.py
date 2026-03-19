@@ -56,9 +56,11 @@ SCRIPTS: List[tuple] = [
     (MARKET_DIR / "gate_spot.py",       MARKET_DIR),
     (MARKET_DIR / "gate_futures.py",    MARKET_DIR),
     # Сканер сигналов
-    (PROJECT_ROOT / "signal_scanner.py", PROJECT_ROOT),
+    (PROJECT_ROOT / "signal_scanner.py",          PROJECT_ROOT),
+    # Запись снапшотов спредов (каждые 0.3с, папки по дням/часам)
+    (PROJECT_ROOT / "signal_snapshot_writer.py",  PROJECT_ROOT),
     # Мониторинг Redis
-    (MARKET_DIR / "redis_monitor.py",    MARKET_DIR),
+    (MARKET_DIR / "redis_monitor.py",             MARKET_DIR),
 ]
 
 
